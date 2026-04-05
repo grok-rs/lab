@@ -1,0 +1,13 @@
+stages:
+  - test
+
+test_with_redis:
+  stage: test
+  image: alpine:latest
+  services:
+    - name: redis:7-alpine
+      alias: cache-server
+  script:
+    - apk add --no-cache redis
+    - redis-cli -h cache-server ping
+    - echo "Redis service test passed"

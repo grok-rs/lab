@@ -1,0 +1,24 @@
+stages:
+  - build
+  - test
+
+build:
+  stage: build
+  image: alpine:latest
+  script:
+    - mkdir -p output
+    - echo "build-result-v1.0" > output/build.txt
+    - echo "Build created output/build.txt"
+  artifacts:
+    paths:
+      - output
+
+test:
+  stage: test
+  image: alpine:latest
+  script:
+    - cat output/build.txt
+    - echo "Test verified build artifact"
+  needs:
+    - job: build
+      artifacts: true

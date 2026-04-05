@@ -1,0 +1,38 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  APP_NAME: "myservice"
+
+build:
+  stage: build
+  image: alpine:latest
+  script:
+    - echo "Building $APP_NAME"
+  artifacts:
+    paths:
+      - dist/
+
+test:
+  stage: test
+  image: alpine:latest
+  script:
+    - echo "Testing $APP_NAME"
+  coverage: '/Coverage: \d+\.\d+%/'
+  needs:
+    - build
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Deploying $APP_NAME"
+  environment:
+    name: production
+    url: https://example.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - when: never

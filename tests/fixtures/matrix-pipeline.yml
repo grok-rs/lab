@@ -1,0 +1,12 @@
+stages:
+  - test
+
+test:
+  stage: test
+  image: alpine:latest
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.10", "3.11", "3.12"]
+        DB: ["postgres", "mysql"]
+  script:
+    - echo "Testing Python $PYTHON_VERSION with $DB"

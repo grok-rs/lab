@@ -1,0 +1,38 @@
+#!/bin/sh
+# lab pre-commit hook — runs formatting, linting, and tests
+set -e
+
+echo "Running pre-commit checks..."
+
+# 1. Prevent secrets from being committed
+if git diff --cached --name-only | grep -q '\.lab/secrets\.env$'; then
+    echo "ERROR: .lab/secrets.env contains secrets and must not be committed."
+    echo "Run: git reset HEAD .lab/secrets.env"
+    exit 1
+fi
+
+# 2. Check formatting
+echo "  Checking formatting..."
+cargo fmt -- --check 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "ERROR: Code is not formatted. Run: cargo fmt"
+    exit 1
+fi
+
+# 3. Run clippy
+echo "  Running clippy..."
+cargo clippy --all-targets --quiet -- -D warnings 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "ERROR: Clippy found issues. Run: cargo clippy --all-targets"
+    exit 1
+fi
+
+# 4. Run tests
+echo "  Running tests..."
+cargo test --quiet 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "ERROR: Tests failed. Run: cargo test"
+    exit 1
+fi
+
+echo "All checks passed."

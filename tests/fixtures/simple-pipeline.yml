@@ -1,0 +1,32 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  RUST_VERSION: "1.80"
+
+build:
+  stage: build
+  image: alpine:latest
+  script:
+    - echo "Building with Rust $RUST_VERSION"
+    - echo "Build complete"
+
+test:
+  stage: test
+  image: alpine:latest
+  script:
+    - echo "Running tests"
+  needs:
+    - build
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Deploying..."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - when: manual
