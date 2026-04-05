@@ -225,24 +225,22 @@ Add to your Claude Code config (`~/.claude/settings.json`):
 
 ### Example AI Interaction
 
-```
-User: "Analyze my pipeline and suggest improvements"
-
-AI: [calls lab_analyze] → 5 findings
-AI: "I found 3 warnings:
-     1. build-affected is missing cache
-     2. deploy images use :latest
-     3. test job missing interruptible flag"
-
-AI: [calls lab_suggest_fix for each]
-AI: "Here are the fixes to apply:
-     1. Add to build-affected:
-        cache:
-          key:
-            files: [pnpm-lock.yaml]
-          paths: [node_modules/]
-     ..."
-```
+> **User**: Analyze my pipeline and suggest improvements
+>
+> **AI** *(calls `lab_analyze`)*: I found 3 warnings:
+> 1. `build-affected` is missing cache — slowing builds
+> 2. Deploy images use `:latest` — non-deterministic
+> 3. `test` job missing `interruptible` flag
+>
+> **AI** *(calls `lab_suggest_fix` for each)*: Here are the fixes:
+>
+> Add to `build-affected`:
+> ```yaml
+> cache:
+>   key:
+>     files: [pnpm-lock.yaml]
+>   paths: [node_modules/]
+> ```
 
 ## Examples
 

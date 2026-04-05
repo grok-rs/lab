@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: GitLab CI/CD YAML Reference
+    url: https://docs.gitlab.com/ci/yaml/
+    about: Official GitLab CI/CD keyword documentation
+  - name: Keyword Coverage
+    url: https://github.com/grok-rs/lab/blob/main/docs/gitlab-ci-reference.md
+    about: Check which keywords are already supported

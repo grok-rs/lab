@@ -1,0 +1,48 @@
+name: GitLab CI Keyword Support
+description: Request support for a GitLab CI/CD keyword
+labels: ["keyword-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Request support for a GitLab CI/CD YAML keyword that lab doesn't handle yet.
+
+  - type: input
+    id: keyword
+    attributes:
+      label: Keyword
+      description: The GitLab CI/CD keyword (e.g., `trigger:forward`, `pages:publish`)
+      placeholder: "keyword:subkey"
+    validations:
+      required: true
+
+  - type: input
+    id: docs_url
+    attributes:
+      label: GitLab docs URL
+      description: Link to the official documentation for this keyword
+      placeholder: "https://docs.gitlab.com/ci/yaml/#keyword"
+
+  - type: textarea
+    id: example
+    attributes:
+      label: YAML example
+      description: How the keyword is used in a real pipeline
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected behavior
+      description: What should lab do when it encounters this keyword?
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is this for your workflow?
+      options:
+        - Blocking — can't use lab without it
+        - Important — workaround exists but painful
+        - Nice to have

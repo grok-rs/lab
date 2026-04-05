@@ -1,0 +1,72 @@
+name: Bug Report
+description: Report a bug in lab
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the details below.
+
+  - type: input
+    id: version
+    attributes:
+      label: lab version
+      description: Output of `lab --version`
+      placeholder: "lab 0.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or `.gitlab-ci.yml` snippet to reproduce
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Actual output
+      description: Paste the terminal output (redact any secrets)
+      render: shell
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command?
+      options:
+        - lab run
+        - lab analyze
+        - lab validate
+        - lab list
+        - lab graph
+        - lab shell
+        - lab secrets
+        - lab mcp-server
+        - Other
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Docker version, Rust version
+      value: |
+        - OS:
+        - Docker:
+        - Rust:
