@@ -376,8 +376,20 @@ async fn run_commands(ctx: &JobContext, container_id: &str, commands: &[String])
 /// Sources /run/secrets/env if it exists (secrets mounted as file).
 fn generate_shell_script(commands: &[String]) -> String {
     let mut script = String::new();
-    // Fix "dubious ownership" for bind-mounted workspace
-    script.push_str("git config --global --add safe.directory /workspace 2>/dev/null || true\n");
+    // Fix "dubious ownership" for bind-mounted workspace.
+    // Write a gitconfig file directly and point GIT_CONFIG_GLOBAL to it.
+    // This works regardless of which git binary is installed (busybox, apk, apt).
+    script.push_str("echo '[safe]\n\tdirectory = *' > /tmp/.lab-gitconfig 2>/dev/null || true\n");
+    script.push_str("export GIT_CONFIG_GLOBAL=/tmp/.lab-gitconfig\n");
+    // Set up SSH for git operations (if SSH agent is forwarded)
+    // Install openssh-client if missing and SSH agent is available
+    script.push_str(concat!(
+        "if [ -S \"$SSH_AUTH_SOCK\" ]; then ",
+        "command -v ssh >/dev/null 2>&1 || (apk add --no-cache openssh-client 2>/dev/null || apt-get install -yq openssh-client 2>/dev/null) >/dev/null 2>&1 || true; ",
+        "mkdir -p /root/.ssh 2>/dev/null; ",
+        "ssh-keyscan gitlab.com github.com bitbucket.org >> /root/.ssh/known_hosts 2>/dev/null || true; ",
+        "fi\n",
+    ));
     // Source secrets file if mounted (secure alternative to env vars)
     script.push_str("[ -f /run/secrets/env ] && . /run/secrets/env\n");
     for cmd in commands {

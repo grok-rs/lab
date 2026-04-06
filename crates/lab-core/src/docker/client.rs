@@ -107,12 +107,19 @@ impl DockerClient {
         entrypoint: Option<&[String]>,
         secrets_file: Option<&str>,
     ) -> Result<String> {
-        let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         let mut binds = vec![format!("{workdir}:/workspace")];
         // Mount secrets file read-only if provided
         if let Some(sf) = secrets_file {
             binds.push(format!("{sf}:/run/secrets/env:ro"));
+        }
+        // Forward SSH agent for git operations (if available)
+        if let Ok(ssh_sock) = std::env::var("SSH_AUTH_SOCK") {
+            if std::path::Path::new(&ssh_sock).exists() {
+                binds.push(format!("{ssh_sock}:/ssh-agent:ro"));
+                env_vec.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
+            }
         }
 
         // Docker Security Hardening (per OWASP Docker Security Cheat Sheet):
@@ -124,8 +131,20 @@ impl DockerClient {
         let host_config = HostConfig {
             binds: Some(binds),
             network_mode: network.map(String::from),
-            // RULE #3: Drop all Linux capabilities
-            cap_drop: Some(vec!["ALL".to_string()]),
+            // RULE #3: Drop dangerous capabilities, keep filesystem access for CI workloads.
+            // Can't use cap_drop ALL because bind-mounted workspace needs DAC_OVERRIDE
+            // to write files owned by the host user.
+            cap_drop: Some(vec![
+                "NET_RAW".to_string(),          // No raw sockets
+                "SYS_ADMIN".to_string(),        // No mount/cgroup/namespace
+                "SYS_PTRACE".to_string(),       // No process tracing
+                "SYS_MODULE".to_string(),       // No kernel module loading
+                "SYS_RAWIO".to_string(),        // No raw I/O
+                "MKNOD".to_string(),            // No device file creation
+                "NET_BIND_SERVICE".to_string(), // No binding to low ports
+                "AUDIT_WRITE".to_string(),      // No audit log writing
+                "SETFCAP".to_string(),          // No setting file capabilities
+            ]),
             // RULE #4: Prevent privilege escalation via setuid/setgid
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             // RULE #7: Resource limits (prevent runaway containers)
