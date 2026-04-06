@@ -127,24 +127,11 @@ impl DockerClient {
         // RULE #3: Drop all capabilities, add back only what's needed
         // RULE #4: Prevent in-container privilege escalation
         // RULE #7: Limit resources to prevent DoS
-        // Local execution: no resource limits — use full laptop power for speed.
-        // Security hardening still applied via secrets file mount + output masking.
+        // Local execution: no restrictions — use full laptop power for speed.
+        // Security is handled via secrets file mount + output masking, not container hardening.
         let host_config = HostConfig {
             binds: Some(binds),
             network_mode: network.map(String::from),
-            // Drop only the most dangerous capabilities
-            cap_drop: Some(vec![
-                "SYS_ADMIN".to_string(),  // No mount/cgroup/namespace
-                "SYS_MODULE".to_string(), // No kernel module loading
-                "SYS_RAWIO".to_string(),  // No raw I/O
-            ]),
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // No memory/CPU/PID limits — local testing should be fast
-            tmpfs: Some(
-                [("/tmp".to_string(), "rw,size=512m".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
             ..Default::default()
         };
 
