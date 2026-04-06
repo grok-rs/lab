@@ -33,6 +33,8 @@ async fn main() -> Result<()> {
             no_cache,
             platforms,
             max_parallel,
+            approve_manual,
+            skip_manual,
             pull_secrets,
             no_secrets,
             secrets_file,
@@ -132,6 +134,13 @@ async fn main() -> Result<()> {
                         .map(|n| n.get())
                         .unwrap_or(4)
                 }),
+                manual_mode: if approve_manual {
+                    lab_core::config::ManualMode::Approve
+                } else if skip_manual {
+                    lab_core::config::ManualMode::Skip
+                } else {
+                    lab_core::config::ManualMode::Prompt
+                },
             };
 
             project_config.apply_to(&mut config);

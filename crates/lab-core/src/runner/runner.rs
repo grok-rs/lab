@@ -92,6 +92,8 @@ impl Runner {
         let masker = crate::secrets::SecretMasker::from_secrets(&job_secrets);
 
         from_fn(move |_ctx: ExecutorCtx| async move {
+            let start = Instant::now();
+
             // Handle resource_group — mutual exclusion via lock file
             // Ref: <https://docs.gitlab.com/ci/yaml/#resource_group>
             let _resource_lock = if let Some(rg) = &job.resource_group {
@@ -120,20 +122,59 @@ impl Runner {
 
             // Ensure lock is released when job completes (via Drop-like cleanup at end)
 
-            // Handle manual_confirmation — prompt user before running
-            // Ref: <https://docs.gitlab.com/ci/yaml/#manual_confirmation>
+            // Handle manual jobs — GitLab pauses and waits for user approval.
+            // Ref: <https://docs.gitlab.com/ci/yaml/#when>
+            //
+            // Behavior:
+            // - `when: manual` → prompt user to approve (play button equivalent)
+            // - `manual_confirmation` → show custom message in the prompt
+            // - User says no → job is skipped (not failed)
+            // - `allow_failure: true` (default for manual) → pipeline continues
             if job.when == crate::model::job::When::Manual {
-                if let Some(msg) = &job.manual_confirmation {
-                    eprintln!("\n  {msg}");
-                    eprint!("  Proceed? [y/N] ");
-                    let mut input = String::new();
-                    if std::io::stdin().read_line(&mut input).is_ok()
-                        && !input.trim().eq_ignore_ascii_case("y")
-                    {
-                        info!(job = %job_name, "manual job skipped by user");
-                        return Ok(());
+                use crate::config::ManualMode;
+
+                let approved = match config.manual_mode {
+                    ManualMode::Approve => {
+                        info!(job = %job_name, "manual job auto-approved (--approve-manual)");
+                        true
                     }
+                    ManualMode::Skip => {
+                        info!(job = %job_name, "manual job auto-skipped (--skip-manual)");
+                        false
+                    }
+                    ManualMode::Prompt => {
+                        let prompt_msg = job
+                            .manual_confirmation
+                            .as_deref()
+                            .unwrap_or("Manual job requires approval to run.");
+
+                        eprintln!();
+                        eprintln!(
+                            "  \x1b[33m⏸ Manual job: {}\x1b[0m  [{}]",
+                            job_name, job.stage
+                        );
+                        eprintln!("  {prompt_msg}");
+                        eprint!("  \x1b[33mRun this job? [y/N]\x1b[0m ");
+
+                        let mut input = String::new();
+                        if std::io::stdin().read_line(&mut input).is_ok() {
+                            input.trim().eq_ignore_ascii_case("y")
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if !approved {
+                    result_tracker.record(
+                        &job_name,
+                        &job.stage,
+                        JobStatus::Success, // Skipped manual = not a failure
+                        start.elapsed(),
+                    );
+                    return Ok(());
                 }
+                info!(job = %job_name, "manual job approved");
             }
 
             // Handle start_in delay (for delayed jobs)
@@ -144,8 +185,6 @@ impl Runner {
                     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 }
             }
-
-            let start = Instant::now();
 
             // Handle trigger:include — child pipeline execution
             // Ref: <https://docs.gitlab.com/ci/yaml/#trigger>

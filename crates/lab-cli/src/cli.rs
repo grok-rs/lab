@@ -65,6 +65,14 @@ pub enum Command {
         #[arg(long)]
         max_parallel: Option<usize>,
 
+        /// Auto-approve all manual jobs (no interactive prompt).
+        #[arg(long, conflicts_with = "skip_manual")]
+        approve_manual: bool,
+
+        /// Auto-skip all manual jobs (no interactive prompt).
+        #[arg(long, conflicts_with = "approve_manual")]
+        skip_manual: bool,
+
         /// Pull secrets from GitLab before running (via glab).
         #[arg(long)]
         pull_secrets: bool,

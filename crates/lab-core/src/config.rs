@@ -36,6 +36,21 @@ pub struct Config {
 
     /// Maximum parallel jobs (default: number of CPUs)
     pub max_parallel: usize,
+
+    /// How to handle manual jobs
+    pub manual_mode: ManualMode,
+}
+
+/// How to handle `when: manual` jobs.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ManualMode {
+    /// Prompt the user interactively (default).
+    #[default]
+    Prompt,
+    /// Auto-approve all manual jobs.
+    Approve,
+    /// Auto-skip all manual jobs.
+    Skip,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,6 +75,7 @@ impl Default for Config {
             no_cache: false,
             platform_overrides: HashMap::new(),
             max_parallel: num_cpus(),
+            manual_mode: ManualMode::default(),
         }
     }
 }
