@@ -197,6 +197,18 @@ pub fn predefined_variables(config: &Config, job_name: &str, stage: &str) -> Res
     set(&mut vars, "CI_COMMIT_REF_NAME", &commit_branch);
     set(&mut vars, "CI_COMMIT_MESSAGE", &commit_message);
 
+    // Set CI_COMMIT_BEFORE_SHA for Nx affected detection
+    // Use the merge-base with the default branch (like GitLab MR pipelines)
+    let before_sha = std::process::Command::new("git")
+        .args(["merge-base", "HEAD", "origin/main"])
+        .current_dir(&workdir)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+    set(&mut vars, "CI_COMMIT_BEFORE_SHA", &before_sha);
+
     // Detect default branch
     let default_branch = std::process::Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
