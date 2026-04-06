@@ -101,8 +101,15 @@ fn expand_recursive(input: &str, vars: &Variables, depth: u32) -> String {
         if chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let var_name: String = chars.by_ref().take_while(|c| *c != '}').collect();
-            // If var_name contains : or - or + it's bash parameter expansion, not a simple var
-            if var_name.contains(':') || var_name.contains('-') || var_name.contains('+') {
+            // If content contains bash parameter expansion operators, pass through to shell.
+            // Operators: :- :+ :? (default/alt/error), %% % ## # (trim), / (replace)
+            if var_name.contains(':')
+                || var_name.contains(":-")
+                || var_name.contains('+')
+                || var_name.contains('%')
+                || var_name.contains('#')
+                || var_name.contains('/')
+            {
                 result.push_str("${");
                 result.push_str(&var_name);
                 result.push('}');
