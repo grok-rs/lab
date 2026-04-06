@@ -22,7 +22,7 @@ tokio = { version = "1.51", features = ["full"] }
 futures = "0.3"
 
 # Docker
-bollard = "0.19"
+bollard = "0.20"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
