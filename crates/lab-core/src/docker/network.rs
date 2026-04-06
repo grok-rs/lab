@@ -1,5 +1,5 @@
-use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkCreateRequest};
 use bollard::Docker;
+use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkCreateRequest};
 use tracing::debug;
 
 use crate::error::{LabError, Result};

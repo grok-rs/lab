@@ -143,7 +143,7 @@ fn handle_tools_list(id: &Value) -> Value {
                 },
                 {
                     "name": "lab_dry_run",
-                    "description": "Show the execution plan for a pipeline without actually running containers. Shows stages, jobs, images, dependencies, and secret availability.",
+                    "description": "Show the execution plan for a pipeline without actually running containers. Shows stages, jobs, images, dependencies, and secret availability. Supports event simulation and multi-job filtering.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -152,9 +152,14 @@ fn handle_tools_list(id: &Value) -> Value {
                                 "description": "Path to .gitlab-ci.yml",
                                 "default": ".gitlab-ci.yml"
                             },
-                            "job": {
+                            "jobs": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Specific jobs to plan (optional, plans all if omitted)"
+                            },
+                            "event": {
                                 "type": "string",
-                                "description": "Specific job to plan (optional, plans all if omitted)"
+                                "description": "Simulate pipeline event (push, merge_request_event, schedule, web, api, trigger)"
                             }
                         }
                     }
@@ -271,6 +276,38 @@ fn handle_tools_list(id: &Value) -> Value {
                     }
                 },
                 {
+                    "name": "lab_artifacts_list",
+                    "description": "List artifacts from previous local pipeline runs. Shows file paths and sizes per job.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "job": {
+                                "type": "string",
+                                "description": "List artifacts for a specific job (optional, lists all if omitted)"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "lab_evaluate_rules",
+                    "description": "Evaluate which jobs would run for a given event type. Shows which rules matched and which jobs are included/excluded.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "description": "Path to .gitlab-ci.yml",
+                                "default": ".gitlab-ci.yml"
+                            },
+                            "event": {
+                                "type": "string",
+                                "description": "Pipeline event type (push, merge_request_event, schedule, web, tag)"
+                            }
+                        },
+                        "required": ["event"]
+                    }
+                },
+                {
                     "name": "lab_variable_expand",
                     "description": "Expand a string containing $VAR or ${VAR} references using the pipeline's variable context. Shows what a value resolves to.",
                     "inputSchema": {
@@ -324,7 +361,11 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
         "lab_explain_job" => tool_explain_job(&file_path, &args),
         "lab_suggest_fix" => tool_suggest_fix(&file_path, &args),
 
-        // WRITE: modifies .lab/ directory
+        // READ-ONLY: artifacts and rules
+        "lab_artifacts_list" => tool_artifacts_list(&args),
+        "lab_evaluate_rules" => tool_evaluate_rules(&file_path, &args),
+
+        // WRITE: modifies secrets store
         "lab_secrets_pull" => tool_secrets_pull(),
         "lab_secrets_init" => tool_secrets_init(&file_path),
 
@@ -438,12 +479,30 @@ fn tool_dry_run(file: &PathBuf, args: &Value) -> Result<String, String> {
     let predefined =
         lab_core::model::variables::predefined_variables(&config, "", "").unwrap_or_default();
     let secret_vars = secrets::load_secrets_file(&workdir).unwrap_or_default();
-    let global_vars = merge_variables(&[&predefined, &pipeline.variables, &secret_vars]);
+    let mut global_vars = merge_variables(&[&predefined, &pipeline.variables, &secret_vars]);
 
-    let job_filter: Option<Vec<String>> = args
-        .get("job")
-        .and_then(|j| j.as_str())
-        .map(|s| vec![s.to_string()]);
+    // Apply event simulation
+    if let Some(event) = args.get("event").and_then(|e| e.as_str()) {
+        let mut event_vars = Vec::new();
+        lab_core::model::variables::apply_pipeline_event(event, &mut event_vars);
+        for (k, v) in event_vars {
+            global_vars.insert(k, lab_core::model::variables::VariableValue::Simple(v));
+        }
+    }
+
+    // Support both single "job" and array "jobs"
+    let job_filter: Option<Vec<String>> =
+        if let Some(jobs) = args.get("jobs").and_then(|j| j.as_array()) {
+            let names: Vec<String> = jobs
+                .iter()
+                .filter_map(|j| j.as_str().map(String::from))
+                .collect();
+            if names.is_empty() { None } else { Some(names) }
+        } else {
+            args.get("job")
+                .and_then(|j| j.as_str())
+                .map(|s| vec![s.to_string()])
+        };
 
     let plan = build_plan(
         &pipeline.stages,
@@ -536,7 +595,10 @@ fn tool_graph(file: &PathBuf) -> Result<String, String> {
     for (name, job) in &pipeline.jobs {
         nodes.push(json!({
             "name": name,
-            "stage": job.stage
+            "stage": job.stage,
+            "image": job.image.as_ref().map(|i| i.name()),
+            "when": format!("{:?}", job.when),
+            "has_services": job.services.as_ref().is_some_and(|s| !s.is_empty()),
         }));
 
         if let Some(needs) = &job.needs {
@@ -649,9 +711,132 @@ fn tool_explain_job(file: &PathBuf, args: &Value) -> Result<String, String> {
         "resource_group": job.resource_group,
         "tags": job.tags,
         "trigger": job.trigger.is_some(),
+        "parallel": job.parallel.as_ref().map(|p| match p {
+            lab_core::model::job::ParallelConfig::Count(n) => json!({"type": "count", "count": n}),
+            lab_core::model::job::ParallelConfig::Matrix { matrix } => json!({
+                "type": "matrix",
+                "combinations": matrix.len(),
+            }),
+        }),
+        "inherit": job.inherit.as_ref().map(|i| json!({
+            "default": format!("{:?}", i.default),
+            "variables": format!("{:?}", i.variables),
+        })),
     });
 
     serde_json::to_string_pretty(&explanation).map_err(|e| e.to_string())
+}
+
+fn tool_artifacts_list(args: &Value) -> Result<String, String> {
+    let workdir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let artifacts_base = lab_core::paths::artifacts_dir(&workdir);
+
+    if !artifacts_base.exists() {
+        return Ok(json!({"jobs": [], "message": "No artifacts found"}).to_string());
+    }
+
+    let job_filter = args.get("job").and_then(|j| j.as_str());
+
+    let mut jobs = Vec::new();
+    for entry in std::fs::read_dir(&artifacts_base)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(filter) = job_filter {
+            if name != filter {
+                continue;
+            }
+        }
+
+        let mut files = Vec::new();
+        let mut total_size: u64 = 0;
+        collect_files(&entry.path(), &entry.path(), &mut files, &mut total_size);
+
+        jobs.push(json!({
+            "job": name,
+            "files": files,
+            "total_size_bytes": total_size,
+            "file_count": files.len(),
+        }));
+    }
+
+    serde_json::to_string_pretty(&json!({"jobs": jobs})).map_err(|e| e.to_string())
+}
+
+fn collect_files(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    files: &mut Vec<Value>,
+    total_size: &mut u64,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, base, files, total_size);
+            } else if let Ok(meta) = path.metadata() {
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                let size = meta.len();
+                *total_size += size;
+                files.push(json!({"path": rel.display().to_string(), "size_bytes": size}));
+            }
+        }
+    }
+}
+
+fn tool_evaluate_rules(file: &PathBuf, args: &Value) -> Result<String, String> {
+    let pipeline = parse_pipeline(file).map_err(|e| e.to_string())?;
+
+    let workdir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let config = lab_core::config::Config {
+        workdir: workdir.clone(),
+        ..Default::default()
+    };
+    let predefined =
+        lab_core::model::variables::predefined_variables(&config, "", "").unwrap_or_default();
+    let secret_vars = secrets::load_secrets_file(&workdir).unwrap_or_default();
+    let mut vars = merge_variables(&[&predefined, &pipeline.variables, &secret_vars]);
+
+    let event = args.get("event").and_then(|e| e.as_str()).unwrap_or("push");
+
+    let mut event_vars = Vec::new();
+    lab_core::model::variables::apply_pipeline_event(event, &mut event_vars);
+    for (k, v) in event_vars {
+        vars.insert(k, lab_core::model::variables::VariableValue::Simple(v));
+    }
+
+    let plan = build_plan(&pipeline.stages, &pipeline.jobs, &vars, None, None)
+        .map_err(|e| e.to_string())?;
+
+    let active_jobs: std::collections::HashSet<String> = plan
+        .stages
+        .iter()
+        .flat_map(|s| s.jobs.iter().map(|j| j.name.clone()))
+        .collect();
+
+    let mut results = Vec::new();
+    for (name, _job) in &pipeline.jobs {
+        results.push(json!({
+            "job": name,
+            "included": active_jobs.contains(name),
+        }));
+    }
+
+    let included_count = results.iter().filter(|r| r["included"] == true).count();
+    let excluded_count = results.len() - included_count;
+
+    serde_json::to_string_pretty(&json!({
+        "event": event,
+        "total_jobs": results.len(),
+        "included": included_count,
+        "excluded": excluded_count,
+        "jobs": results,
+    }))
+    .map_err(|e| e.to_string())
 }
 
 fn tool_suggest_fix(file: &PathBuf, args: &Value) -> Result<String, String> {
