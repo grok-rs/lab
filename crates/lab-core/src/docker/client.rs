@@ -127,34 +127,21 @@ impl DockerClient {
         // RULE #3: Drop all capabilities, add back only what's needed
         // RULE #4: Prevent in-container privilege escalation
         // RULE #7: Limit resources to prevent DoS
-        // RULE #8: tmpfs for /tmp instead of writable layer
+        // Local execution: no resource limits — use full laptop power for speed.
+        // Security hardening still applied via secrets file mount + output masking.
         let host_config = HostConfig {
             binds: Some(binds),
             network_mode: network.map(String::from),
-            // RULE #3: Drop dangerous capabilities, keep filesystem access for CI workloads.
-            // Can't use cap_drop ALL because bind-mounted workspace needs DAC_OVERRIDE
-            // to write files owned by the host user.
+            // Drop only the most dangerous capabilities
             cap_drop: Some(vec![
-                "NET_RAW".to_string(),          // No raw sockets
-                "SYS_ADMIN".to_string(),        // No mount/cgroup/namespace
-                "SYS_PTRACE".to_string(),       // No process tracing
-                "SYS_MODULE".to_string(),       // No kernel module loading
-                "SYS_RAWIO".to_string(),        // No raw I/O
-                "MKNOD".to_string(),            // No device file creation
-                "NET_BIND_SERVICE".to_string(), // No binding to low ports
-                "AUDIT_WRITE".to_string(),      // No audit log writing
-                "SETFCAP".to_string(),          // No setting file capabilities
+                "SYS_ADMIN".to_string(),  // No mount/cgroup/namespace
+                "SYS_MODULE".to_string(), // No kernel module loading
+                "SYS_RAWIO".to_string(),  // No raw I/O
             ]),
-            // RULE #4: Prevent privilege escalation via setuid/setgid
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // RULE #7: Resource limits (prevent runaway containers)
-            // Defaults match GitLab.com saas-linux-medium-amd64 (2 vCPU, 8GB)
-            memory: Some(8 * 1024 * 1024 * 1024), // 8GB max memory
-            pids_limit: Some(1024),               // Max 1024 processes
-            // No CPU limit — use all available cores for faster builds
-            // RULE #8: tmpfs for temp files
+            // No memory/CPU/PID limits — local testing should be fast
             tmpfs: Some(
-                [("/tmp".to_string(), "rw,noexec,nosuid,size=256m".to_string())]
+                [("/tmp".to_string(), "rw,size=512m".to_string())]
                     .into_iter()
                     .collect(),
             ),

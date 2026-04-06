@@ -392,15 +392,43 @@ fn generate_shell_script(commands: &[String]) -> String {
     ));
     // Source secrets file if mounted (secure alternative to env vars)
     script.push_str("[ -f /run/secrets/env ] && . /run/secrets/env\n");
-    for cmd in commands {
-        // Echo the command in a distinct color (section markers)
-        script.push_str(&format!(
-            "printf '\\033[0;36m$ {}\\033[0m\\n'\n",
-            cmd.replace('\'', "'\\''")
-        ));
+
+    // Define timing function for step-level profiling
+    script.push_str("_lab_start_time() { date +%s%N 2>/dev/null || date +%s 2>/dev/null; }\n");
+    script.push_str("_LAB_PIPELINE_START=$(_lab_start_time)\n");
+
+    for (i, cmd) in commands.iter().enumerate() {
+        let escaped = cmd.replace('\'', "'\\''");
+        // Print command with step number
+        script.push_str(&format!("printf '\\033[0;36m$ {}\\033[0m\\n'\n", escaped));
+        // Capture start time
+        script.push_str(&format!("_LAB_STEP{i}_START=$(_lab_start_time)\n"));
+        // Execute command
         script.push_str(cmd);
         script.push('\n');
+        // Capture end time and print duration
+        script.push_str(&format!(
+            concat!(
+                "_LAB_STEP{i}_END=$(_lab_start_time); ",
+                "_LAB_STEP{i}_DUR=$(( (_LAB_STEP{i}_END - _LAB_STEP{i}_START) / 1000000000 )); ",
+                "[ \"$_LAB_STEP{i}_DUR\" -gt 0 ] 2>/dev/null && ",
+                "printf '\\033[2m  step {step}/{total}: %dm %ds\\033[0m\\n' ",
+                "$((_LAB_STEP{i}_DUR / 60)) $((_LAB_STEP{i}_DUR % 60))\n",
+            ),
+            i = i,
+            step = i + 1,
+            total = commands.len(),
+        ));
     }
+
+    // Print total execution time
+    script.push_str(concat!(
+        "_LAB_PIPELINE_END=$(_lab_start_time); ",
+        "_LAB_TOTAL=$(( (_LAB_PIPELINE_END - _LAB_PIPELINE_START) / 1000000000 )); ",
+        "printf '\\033[1;32m  total: %dm %ds\\033[0m\\n' ",
+        "$((_LAB_TOTAL / 60)) $((_LAB_TOTAL % 60)) 2>/dev/null || true\n",
+    ));
+
     script
 }
 
