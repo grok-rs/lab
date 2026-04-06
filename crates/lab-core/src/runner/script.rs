@@ -231,6 +231,22 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
         }
     }
 
+    // Fix file ownership — container runs as root but host user needs to own the files.
+    // Without this, .nx/, dist/, node_modules/ etc. become root-owned and break local tools.
+    let uid_gid = crate::docker::client::get_current_uid_gid();
+    let _ = ctx
+        .docker
+        .run_in_container(
+            &container_id,
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("chown -R {uid_gid} /workspace 2>/dev/null || true"),
+            ],
+            &indexmap::IndexMap::new(),
+        )
+        .await;
+
     // Cleanup job container
     let _ = ctx.docker.stop_container(&container_id).await;
     let _ = ctx.docker.remove_container(&container_id).await;

@@ -148,17 +148,13 @@ impl DockerClient {
             ..Default::default()
         };
 
-        // Run as current user to prevent root-owned files in bind-mounted workspace.
-        // This is critical — without it, Docker creates root-owned files in .nx/, dist/,
-        // node_modules/ etc. that the host user can't modify or delete.
-        let uid_gid = get_current_uid_gid();
-
         let mut config = ContainerConfig {
             image: Some(image.to_string()),
             env: Some(env_vec),
             working_dir: Some("/workspace".to_string()),
             host_config: Some(host_config),
-            user: Some(uid_gid),
+            // Note: containers run as root (needed for apk/apt package install).
+            // File ownership is fixed after job completes via chown.
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
             ..Default::default()
         };
@@ -332,7 +328,7 @@ impl DockerClient {
 }
 
 /// Get current user's UID:GID without unsafe code.
-fn get_current_uid_gid() -> String {
+pub fn get_current_uid_gid() -> String {
     let uid = std::process::Command::new("id")
         .args(["-u"])
         .output()
