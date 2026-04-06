@@ -393,41 +393,30 @@ fn generate_shell_script(commands: &[String]) -> String {
     // Source secrets file if mounted (secure alternative to env vars)
     script.push_str("[ -f /run/secrets/env ] && . /run/secrets/env\n");
 
-    // Define timing function for step-level profiling
-    script.push_str("_lab_start_time() { date +%s%N 2>/dev/null || date +%s 2>/dev/null; }\n");
-    script.push_str("_LAB_PIPELINE_START=$(_lab_start_time)\n");
+    // Step-level profiling using epoch seconds (works on Alpine/busybox)
+    script.push_str("_LAB_T0=$(date +%s)\n");
 
     for (i, cmd) in commands.iter().enumerate() {
         let escaped = cmd.replace('\'', "'\\''");
-        // Print command with step number
         script.push_str(&format!("printf '\\033[0;36m$ {}\\033[0m\\n'\n", escaped));
-        // Capture start time
-        script.push_str(&format!("_LAB_STEP{i}_START=$(_lab_start_time)\n"));
-        // Execute command
+        script.push_str(&format!("_LAB_S{i}=$(date +%s)\n"));
         script.push_str(cmd);
         script.push('\n');
-        // Capture end time and print duration
         script.push_str(&format!(
-            concat!(
-                "_LAB_STEP{i}_END=$(_lab_start_time); ",
-                "_LAB_STEP{i}_DUR=$(( (_LAB_STEP{i}_END - _LAB_STEP{i}_START) / 1000000000 )); ",
-                "[ \"$_LAB_STEP{i}_DUR\" -gt 0 ] 2>/dev/null && ",
-                "printf '\\033[2m  step {step}/{total}: %dm %ds\\033[0m\\n' ",
-                "$((_LAB_STEP{i}_DUR / 60)) $((_LAB_STEP{i}_DUR % 60))\n",
-            ),
+            "_LAB_E{i}=$(date +%s); _LAB_D{i}=$((_LAB_E{i} - _LAB_S{i})); \
+             printf '\\033[2m  [{step}/{total}] %dm %ds\\033[0m\\n' \
+             $((_LAB_D{i} / 60)) $((_LAB_D{i} % 60))\n",
             i = i,
             step = i + 1,
             total = commands.len(),
         ));
     }
 
-    // Print total execution time
-    script.push_str(concat!(
-        "_LAB_PIPELINE_END=$(_lab_start_time); ",
-        "_LAB_TOTAL=$(( (_LAB_PIPELINE_END - _LAB_PIPELINE_START) / 1000000000 )); ",
-        "printf '\\033[1;32m  total: %dm %ds\\033[0m\\n' ",
-        "$((_LAB_TOTAL / 60)) $((_LAB_TOTAL % 60)) 2>/dev/null || true\n",
-    ));
+    script.push_str(
+        "_LAB_TF=$(date +%s); _LAB_TT=$((_LAB_TF - _LAB_T0)); \
+         printf '\\n\\033[1;32m  total: %dm %ds\\033[0m\\n' \
+         $((_LAB_TT / 60)) $((_LAB_TT % 60))\n",
+    );
 
     script
 }
