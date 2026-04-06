@@ -145,6 +145,21 @@ pub enum Command {
         shell: Option<String>,
     },
 
+    /// Analyze pipeline performance from GitLab job history (via glab).
+    Report {
+        /// Path to .gitlab-ci.yml.
+        #[arg(short, long, default_value = ".gitlab-ci.yml")]
+        file: PathBuf,
+
+        /// Number of recent pipelines to analyze.
+        #[arg(long, default_value = "50")]
+        count: u32,
+
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
+    },
+
     /// Start MCP (Model Context Protocol) server for AI agent integration.
     /// Reads JSON-RPC from stdin, writes responses to stdout.
     #[command(name = "mcp-server")]

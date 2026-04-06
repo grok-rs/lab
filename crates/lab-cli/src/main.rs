@@ -337,6 +337,45 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Report {
+            file: _,
+            count,
+            output,
+        } => {
+            let workdir = std::env::current_dir()?;
+            let (project, _) = lab_core::secrets::detect_gitlab_paths(&workdir)
+                .context("failed to detect GitLab project")?;
+
+            let encoded = project.replace('/', "%2F");
+            let api_path =
+                format!("projects/{encoded}/jobs?per_page={count}&scope[]=success&scope[]=failed");
+
+            let output_data = std::process::Command::new("glab")
+                .args(["api", &api_path])
+                .output()
+                .context("failed to run glab")?;
+
+            if !output_data.status.success() {
+                anyhow::bail!(
+                    "glab error: {}",
+                    String::from_utf8_lossy(&output_data.stderr)
+                );
+            }
+
+            let jobs: Vec<serde_json::Value> =
+                serde_json::from_slice(&output_data.stdout).context("failed to parse jobs")?;
+
+            match output {
+                cli::OutputFormat::Json => {
+                    let report = build_performance_report(&jobs);
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                cli::OutputFormat::Text => {
+                    print_performance_report(&jobs);
+                }
+            }
+        }
+
         Command::McpServer => {
             mcp::run_server();
         }
@@ -537,6 +576,198 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_performance_report(jobs: &[serde_json::Value]) -> serde_json::Value {
+    use std::collections::BTreeMap;
+
+    let mut stats: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut failures: BTreeMap<String, u32> = BTreeMap::new();
+    let mut runners: BTreeMap<String, u32> = BTreeMap::new();
+    let mut queue_times: Vec<f64> = Vec::new();
+
+    for j in jobs {
+        let name = j["name"].as_str().unwrap_or("unknown").to_string();
+        let dur = j.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let queued = j
+            .get("queued_duration")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let status = j["status"].as_str().unwrap_or("");
+        let runner = j
+            .get("runner")
+            .and_then(|r| r.get("description"))
+            .and_then(|d| d.as_str())
+            .unwrap_or("unknown");
+
+        stats.entry(name.clone()).or_default().push(dur);
+        if status == "failed" {
+            *failures.entry(name).or_insert(0) += 1;
+        }
+        *runners.entry(runner.to_string()).or_insert(0) += 1;
+        queue_times.push(queued);
+    }
+
+    let job_stats: Vec<serde_json::Value> = stats
+        .iter()
+        .map(|(name, durations)| {
+            let mut sorted = durations.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+            let p90 =
+                sorted[((sorted.len() as f64) * 0.9) as usize].min(*sorted.last().unwrap_or(&0.0));
+            let fails = failures.get(name).copied().unwrap_or(0);
+            serde_json::json!({
+                "name": name,
+                "runs": sorted.len(),
+                "avg_seconds": avg.round(),
+                "min_seconds": sorted.first().unwrap_or(&0.0).round(),
+                "max_seconds": sorted.last().unwrap_or(&0.0).round(),
+                "p90_seconds": p90.round(),
+                "failures": fails,
+                "failure_rate": format!("{:.0}%", (fails as f64 / sorted.len() as f64) * 100.0),
+            })
+        })
+        .collect();
+
+    let avg_queue = if queue_times.is_empty() {
+        0.0
+    } else {
+        queue_times.iter().sum::<f64>() / queue_times.len() as f64
+    };
+
+    serde_json::json!({
+        "total_jobs_analyzed": jobs.len(),
+        "jobs": job_stats,
+        "avg_queue_time_seconds": avg_queue.round(),
+        "runner_distribution": runners,
+    })
+}
+
+fn print_performance_report(jobs: &[serde_json::Value]) {
+    use std::collections::BTreeMap;
+
+    let mut stats: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut failures: BTreeMap<String, u32> = BTreeMap::new();
+    let mut _total_pipeline_time: f64 = 0.0;
+
+    for j in jobs {
+        let name = j["name"].as_str().unwrap_or("unknown").to_string();
+        let dur = j.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let status = j["status"].as_str().unwrap_or("");
+        stats.entry(name.clone()).or_default().push(dur);
+        if status == "failed" {
+            *failures.entry(name).or_insert(0) += 1;
+        }
+        _total_pipeline_time += dur;
+    }
+
+    println!(
+        "{}",
+        console::style("Pipeline Performance Report")
+            .bold()
+            .underlined()
+    );
+    println!("  Analyzed {} jobs\n", console::style(jobs.len()).cyan());
+
+    // Table header
+    println!(
+        "  {:<25} {:>5} {:>8} {:>8} {:>8} {:>8} {:>6}",
+        "Job", "Runs", "Avg", "Min", "Max", "P90", "Fail%"
+    );
+    println!("  {}", "-".repeat(75));
+
+    let mut bottleneck_name = String::new();
+    let mut bottleneck_avg = 0.0f64;
+
+    for (name, durations) in &stats {
+        let mut sorted = durations.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        let p90_idx = ((sorted.len() as f64) * 0.9) as usize;
+        let p90 = sorted.get(p90_idx).copied().unwrap_or(0.0);
+        let fails = failures.get(name).copied().unwrap_or(0);
+        let fail_rate = (fails as f64 / sorted.len() as f64) * 100.0;
+
+        let fmt = |s: f64| -> String { format!("{}m {:02}s", (s as u64) / 60, (s as u64) % 60) };
+
+        let avg_style = if avg > 300.0 {
+            console::style(fmt(avg)).red()
+        } else if avg > 120.0 {
+            console::style(fmt(avg)).yellow()
+        } else {
+            console::style(fmt(avg)).green()
+        };
+
+        let fail_style = if fail_rate > 10.0 {
+            console::style(format!("{fail_rate:.0}%")).red()
+        } else {
+            console::style(format!("{fail_rate:.0}%")).dim()
+        };
+
+        println!(
+            "  {:<25} {:>5} {:>8} {:>8} {:>8} {:>8} {:>6}",
+            name,
+            sorted.len(),
+            avg_style,
+            fmt(*sorted.first().unwrap_or(&0.0)),
+            fmt(*sorted.last().unwrap_or(&0.0)),
+            fmt(p90),
+            fail_style,
+        );
+
+        if avg > bottleneck_avg {
+            bottleneck_avg = avg;
+            bottleneck_name = name.clone();
+        }
+    }
+
+    // Bottleneck analysis
+    println!();
+    println!("{}", console::style("Bottleneck Analysis:").bold());
+    println!(
+        "  Slowest job: {} (avg {}m {}s)",
+        console::style(&bottleneck_name).red().bold(),
+        (bottleneck_avg as u64) / 60,
+        (bottleneck_avg as u64) % 60,
+    );
+
+    // Suggestions
+    println!();
+    println!("{}", console::style("Optimization Suggestions:").bold());
+
+    for (name, durations) in &stats {
+        let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+        let max = durations.iter().cloned().fold(0.0f64, f64::max);
+        let variance = max - durations.iter().cloned().fold(f64::MAX, f64::min);
+
+        if avg > 300.0 {
+            println!(
+                "  {} {} — avg {}m, consider splitting into parallel jobs or using needs: for DAG",
+                console::style("!").red().bold(),
+                name,
+                (avg as u64) / 60
+            );
+        }
+        if variance > avg * 0.5 && durations.len() > 2 {
+            println!(
+                "  {} {} — high variance ({}m..{}m), check cache hit rate or runner consistency",
+                console::style("~").yellow(),
+                name,
+                (durations.iter().cloned().fold(f64::MAX, f64::min) as u64) / 60,
+                (max as u64) / 60,
+            );
+        }
+        let fails = failures.get(name).copied().unwrap_or(0);
+        if fails > 0 && (fails as f64 / durations.len() as f64) > 0.1 {
+            println!(
+                "  {} {} — {:.0}% failure rate, investigate flaky tests or infra issues",
+                console::style("✗").red().bold(),
+                name,
+                (fails as f64 / durations.len() as f64) * 100.0,
+            );
+        }
+    }
 }
 
 /// Clean up any leftover lab Docker containers and networks.

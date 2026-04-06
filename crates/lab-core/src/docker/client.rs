@@ -148,9 +148,10 @@ impl DockerClient {
             // RULE #4: Prevent privilege escalation via setuid/setgid
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             // RULE #7: Resource limits (prevent runaway containers)
-            memory: Some(2 * 1024 * 1024 * 1024), // 2GB max memory
-            nano_cpus: Some(4_000_000_000),       // 4 CPU cores max
-            pids_limit: Some(512),                // Max 512 processes
+            // Defaults match GitLab.com saas-linux-medium-amd64 (2 vCPU, 8GB)
+            memory: Some(8 * 1024 * 1024 * 1024), // 8GB max memory
+            pids_limit: Some(1024),               // Max 1024 processes
+            // No CPU limit — use all available cores for faster builds
             // RULE #8: tmpfs for temp files
             tmpfs: Some(
                 [("/tmp".to_string(), "rw,noexec,nosuid,size=256m".to_string())]
