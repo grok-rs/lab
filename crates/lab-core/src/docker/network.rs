@@ -30,7 +30,7 @@ pub async fn connect_to_network(
     aliases: &[String],
 ) -> Result<()> {
     let request = NetworkConnectRequest {
-        container: Some(container_id.to_string()),
+        container: container_id.to_string(),
         endpoint_config: Some(EndpointSettings {
             aliases: Some(aliases.to_vec()),
             ..Default::default()
