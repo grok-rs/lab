@@ -30,12 +30,14 @@ pub enum Command {
         #[arg(short = 'v', long = "var", value_parser = parse_key_val)]
         variables: Vec<(String, String)>,
 
-        /// Simulate a pipeline event: push, merge_request_event, tag, web, schedule.
-        /// Sets CI_PIPELINE_SOURCE and related variables automatically.
+        /// Simulate a pipeline event type. Sets CI_PIPELINE_SOURCE and related variables.
+        /// Values: push, merge_request_event, schedule, web, api, trigger, pipeline,
+        /// parent_pipeline, chat, webide, external_pull_request_event.
         #[arg(long)]
         event: Option<String>,
 
-        /// Simulate a tag pipeline (shorthand for --event tag --var CI_COMMIT_TAG=<value>).
+        /// Simulate a tag pipeline. Sets CI_COMMIT_TAG and CI_PIPELINE_SOURCE=push.
+        /// Example: --tag myapp/v1.2.3
         #[arg(long)]
         tag: Option<String>,
 

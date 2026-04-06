@@ -42,23 +42,74 @@ async fn main() -> Result<()> {
         } => {
             logging::init(verbose);
 
-            // Handle --tag shorthand: sets event=tag + CI_COMMIT_TAG
+            // Handle --tag shorthand: simulates a tag push pipeline
             if let Some(tag_value) = &tag {
                 variables.push(("CI_COMMIT_TAG".into(), tag_value.clone()));
                 variables.push(("CI_PIPELINE_SOURCE".into(), "push".into()));
+                // Extract ref name from tag
+                let ref_name = tag_value
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(tag_value)
+                    .to_string();
+                variables.push(("CI_COMMIT_REF_NAME".into(), ref_name));
             }
 
-            // Handle --event: override CI_PIPELINE_SOURCE and set related vars
+            // Handle --event: set CI_PIPELINE_SOURCE and related vars per event type.
+            // All possible values from GitLab docs:
+            // https://docs.gitlab.com/ci/jobs/job_rules/#ci_pipeline_source-predefined-variable
             if let Some(evt) = &event {
                 variables.push(("CI_PIPELINE_SOURCE".into(), evt.clone()));
                 match evt.as_str() {
+                    "push" => {
+                        // Default for branch pushes — auto-detected already
+                    }
+                    "merge_request_event" => {
+                        // MR pipeline — needs MR-specific vars
+                        variables.push(("CI_MERGE_REQUEST_IID".into(), "0".into()));
+                    }
                     "schedule" => {
                         variables.push(("CI_PIPELINE_SCHEDULE".into(), "true".into()));
                     }
-                    "web" | "api" => {
-                        // Manual/API triggers
+                    "web" => {
+                        // Manual trigger via GitLab UI "Run pipeline"
                     }
-                    _ => {}
+                    "api" => {
+                        // Triggered via /api/v4/projects/:id/pipeline
+                    }
+                    "trigger" => {
+                        // Triggered via trigger token
+                        variables.push(("CI_PIPELINE_TRIGGERED".into(), "true".into()));
+                    }
+                    "pipeline" => {
+                        // Multi-project pipeline (downstream)
+                    }
+                    "parent_pipeline" => {
+                        // Child pipeline triggered by parent
+                    }
+                    "chat" => {
+                        // GitLab ChatOps command
+                    }
+                    "webide" => {
+                        // Web IDE pipeline
+                    }
+                    "external_pull_request_event" => {
+                        // GitHub external PR
+                    }
+                    "ondemand_dast_scan" | "ondemand_dast_validation" => {
+                        // DAST scan pipelines
+                    }
+                    "security_orchestration_policy" => {
+                        // Scheduled scan execution policy
+                    }
+                    other => {
+                        eprintln!(
+                            "Warning: unknown event '{}'. Valid events: push, merge_request_event, \
+                             schedule, web, api, trigger, pipeline, parent_pipeline, chat, webide, \
+                             external_pull_request_event",
+                            other
+                        );
+                    }
                 }
             }
 
@@ -132,7 +183,9 @@ async fn main() -> Result<()> {
                 &user_vars,
             ]);
 
-            // Evaluate workflow:rules
+            // Evaluate workflow:rules — gate pipeline + merge matched rule variables
+            // Ref: https://docs.gitlab.com/ci/yaml/#workflowrulesvariables
+            let mut global_vars = global_vars;
             if let Some(workflow) = &pipeline.workflow {
                 if !workflow.rules.is_empty() {
                     use lab_core::model::job::When;
@@ -145,7 +198,14 @@ async fn main() -> Result<()> {
                             println!("Pipeline blocked by workflow:rules — no matching rule.");
                             return Ok(());
                         }
-                        _ => {}
+                        RuleResult::Matched { variables, .. } => {
+                            // Merge workflow:rules:variables into global context
+                            if let Some(wf_vars) = variables {
+                                for (k, v) in wf_vars {
+                                    global_vars.insert(k, v);
+                                }
+                            }
+                        }
                     }
                 }
             }

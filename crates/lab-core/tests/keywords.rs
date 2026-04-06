@@ -2161,3 +2161,421 @@ deploy_production:
     let plan = build_plan(&pipeline.stages, &pipeline.jobs, &vars, None, None).unwrap();
     assert!(!plan.stages.is_empty());
 }
+
+// ============================================================
+// Pipeline Event Simulation
+// ============================================================
+
+/// Helper: build plan with specific CI variables to simulate events.
+fn plan_with_vars(
+    file: &tempfile::NamedTempFile,
+    extra_vars: &[(&str, &str)],
+) -> (
+    lab_core::model::pipeline::Pipeline,
+    lab_core::model::pipeline::Plan,
+) {
+    use lab_core::model::rules::{RuleResult, evaluate_rules};
+    use lab_core::model::variables::{Variables, merge_variables};
+
+    let pipeline = parse_pipeline(file.path()).unwrap();
+
+    let mut vars = Variables::new();
+    for (k, v) in extra_vars {
+        vars.insert(k.to_string(), VariableValue::Simple(v.to_string()));
+    }
+    let mut global = merge_variables(&[&pipeline.variables, &vars]);
+
+    // Evaluate workflow:rules and merge matched variables
+    if let Some(wf) = &pipeline.workflow {
+        if !wf.rules.is_empty() {
+            match evaluate_rules(&wf.rules, &global, When::Always) {
+                RuleResult::Matched {
+                    when: When::Never, ..
+                }
+                | RuleResult::NotMatched => {
+                    return (pipeline, lab_core::model::pipeline::Plan { stages: vec![] });
+                }
+                RuleResult::Matched { variables, .. } => {
+                    if let Some(wf_vars) = variables {
+                        for (k, v) in wf_vars {
+                            global.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let plan = build_plan(&pipeline.stages, &pipeline.jobs, &global, None, None).unwrap();
+    (pipeline, plan)
+}
+
+fn job_names(plan: &lab_core::model::pipeline::Plan) -> Vec<String> {
+    plan.stages
+        .iter()
+        .flat_map(|s| s.jobs.iter().map(|j| j.name.clone()))
+        .collect()
+}
+
+#[test]
+fn test_event_push_triggers_main_jobs() {
+    let file = write_yaml(
+        r#"
+stages: [test, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+test:
+  stage: test
+  script: [echo test]
+
+deploy:
+  stage: deploy
+  script: [echo deploy]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+    - when: never
+"#,
+    );
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "push"), ("CI_COMMIT_BRANCH", "main")],
+    );
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(names.contains(&"deploy".to_string()));
+}
+
+#[test]
+fn test_event_mr_excludes_deploy() {
+    let file = write_yaml(
+        r#"
+stages: [test, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+test:
+  stage: test
+  script: [echo test]
+
+deploy:
+  stage: deploy
+  script: [echo deploy]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+    - when: never
+"#,
+    );
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[
+            ("CI_PIPELINE_SOURCE", "merge_request_event"),
+            ("CI_COMMIT_BRANCH", "feature/login"),
+        ],
+    );
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    // deploy should NOT run — branch is not main
+    assert!(!names.contains(&"deploy".to_string()));
+}
+
+#[test]
+fn test_event_tag_triggers_tag_jobs() {
+    let file = write_yaml(
+        r#"
+stages: [build, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_COMMIT_TAG
+
+build:
+  stage: build
+  script: [echo build]
+
+build-tagged:
+  stage: build
+  script: [echo build-tagged]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+/
+
+deploy-prod:
+  stage: deploy
+  script: [echo deploy]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+/
+      when: manual
+"#,
+    );
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "push"), ("CI_COMMIT_TAG", "v1.2.3")],
+    );
+    let names = job_names(&plan);
+    assert!(names.contains(&"build".to_string()));
+    assert!(names.contains(&"build-tagged".to_string()));
+    assert!(names.contains(&"deploy-prod".to_string()));
+}
+
+#[test]
+fn test_event_tag_without_match_excludes_tag_jobs() {
+    let file = write_yaml(
+        r#"
+stages: [build]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+build:
+  stage: build
+  script: [echo build]
+
+build-tagged:
+  stage: build
+  script: [echo build-tagged]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+/
+"#,
+    );
+    // No CI_COMMIT_TAG set — tag job should not run
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "push")]);
+    let names = job_names(&plan);
+    assert!(names.contains(&"build".to_string()));
+    assert!(!names.contains(&"build-tagged".to_string()));
+}
+
+#[test]
+fn test_event_schedule() {
+    let file = write_yaml(
+        r#"
+stages: [test, cleanup]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+test:
+  stage: test
+  script: [echo test]
+
+nightly-cleanup:
+  stage: cleanup
+  script: [echo cleanup]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+"#,
+    );
+    // Schedule event should trigger nightly-cleanup
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "schedule")]);
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(names.contains(&"nightly-cleanup".to_string()));
+
+    // Push event should NOT trigger nightly-cleanup
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "push")]);
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(!names.contains(&"nightly-cleanup".to_string()));
+}
+
+#[test]
+fn test_event_web_with_workflow_variables() {
+    // Tests that workflow:rules:variables are merged into the context
+    let file = write_yaml(
+        r#"
+stages: [test, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      variables:
+        PIPELINE_TYPE: "manual_deploy"
+    - if: $CI_COMMIT_BRANCH
+
+test:
+  stage: test
+  script: [echo test]
+  rules:
+    - if: $PIPELINE_TYPE == "manual_deploy"
+      when: never
+    - when: on_success
+
+manual-deploy:
+  stage: deploy
+  script: [echo deploy]
+  rules:
+    - if: $PIPELINE_TYPE == "manual_deploy"
+"#,
+    );
+    // Web trigger should inject PIPELINE_TYPE=manual_deploy
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "web"), ("CI_COMMIT_BRANCH", "main")],
+    );
+    let names = job_names(&plan);
+    // test should be excluded (when: never for manual_deploy)
+    assert!(!names.contains(&"test".to_string()));
+    // manual-deploy should run
+    assert!(names.contains(&"manual-deploy".to_string()));
+
+    // Push trigger should NOT inject PIPELINE_TYPE
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "push"), ("CI_COMMIT_BRANCH", "main")],
+    );
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(!names.contains(&"manual-deploy".to_string()));
+}
+
+#[test]
+fn test_event_workflow_blocks_unknown_source() {
+    let file = write_yaml(
+        r#"
+stages: [test]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+test:
+  stage: test
+  script: [echo test]
+"#,
+    );
+    // Unknown source should be blocked by workflow:rules
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "chat")]);
+    assert!(plan.stages.is_empty());
+}
+
+#[test]
+fn test_event_trigger_downstream() {
+    let file = write_yaml(
+        r#"
+stages: [test]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "pipeline"
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+test:
+  stage: test
+  script: [echo test]
+
+downstream-only:
+  stage: test
+  script: [echo downstream]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "pipeline"
+"#,
+    );
+    // Multi-project pipeline source
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "pipeline")]);
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(names.contains(&"downstream-only".to_string()));
+
+    // Push should not trigger downstream-only
+    let (_, plan) = plan_with_vars(&file, &[("CI_PIPELINE_SOURCE", "push")]);
+    let names = job_names(&plan);
+    assert!(names.contains(&"test".to_string()));
+    assert!(!names.contains(&"downstream-only".to_string()));
+}
+
+#[test]
+fn test_event_multiple_rules_first_match_wins() {
+    let file = write_yaml(
+        r#"
+stages: [deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      variables:
+        TARGET: "manual"
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        TARGET: "auto"
+    - when: never
+
+deploy:
+  stage: deploy
+  script: [echo "deploying to $TARGET"]
+"#,
+    );
+    // Web should match first rule → TARGET=manual
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "web"), ("CI_COMMIT_BRANCH", "main")],
+    );
+    assert!(!plan.stages.is_empty());
+
+    // Push on main should match second rule → TARGET=auto
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[("CI_PIPELINE_SOURCE", "push"), ("CI_COMMIT_BRANCH", "main")],
+    );
+    assert!(!plan.stages.is_empty());
+
+    // Push on feature branch → no rule matches → blocked
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[
+            ("CI_PIPELINE_SOURCE", "push"),
+            ("CI_COMMIT_BRANCH", "feature"),
+        ],
+    );
+    assert!(plan.stages.is_empty());
+}
+
+#[test]
+fn test_event_draft_commit_blocked() {
+    // Simulates: workflow:rules blocks pipelines with -draft suffix in commit title
+    let file = write_yaml(
+        r#"
+stages: [test]
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TITLE =~ /-draft$/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+test:
+  stage: test
+  script: [echo test]
+"#,
+    );
+    // Draft commit → blocked
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[
+            ("CI_PIPELINE_SOURCE", "push"),
+            ("CI_COMMIT_TITLE", "wip: my-draft"),
+        ],
+    );
+    assert!(plan.stages.is_empty());
+
+    // Normal commit → runs
+    let (_, plan) = plan_with_vars(
+        &file,
+        &[
+            ("CI_PIPELINE_SOURCE", "push"),
+            ("CI_COMMIT_TITLE", "feat: add login"),
+        ],
+    );
+    assert!(!plan.stages.is_empty());
+}
