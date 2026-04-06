@@ -15,6 +15,18 @@ use crate::error::{LabError, Result};
 
 use super::container::RunResult;
 
+/// Options for creating a job container.
+pub struct CreateJobOpts<'a> {
+    pub image: &'a str,
+    pub env: &'a IndexMap<String, String>,
+    pub workdir: &'a str,
+    pub network: Option<&'a str>,
+    pub entrypoint: Option<&'a [String]>,
+    pub secrets_file: Option<&'a str>,
+    pub cpus: Option<f64>,
+    pub memory: Option<i64>,
+}
+
 /// Wrapper around the bollard Docker client.
 ///
 /// Ref: <https://docs.gitlab.com/runner/executors/docker/>
@@ -35,24 +47,41 @@ impl DockerClient {
         &self.docker
     }
 
-    /// Pull a Docker image.
+    /// Pull a Docker image with progress indicator.
     pub async fn pull_image(&self, image: &str, force: bool) -> Result<()> {
         if !force && self.docker.inspect_image(image).await.is_ok() {
             debug!(image, "image already available locally");
             return Ok(());
         }
 
-        info!(image, "pulling image");
+        let spinner = indicatif::ProgressBar::new_spinner();
+        spinner.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("  {spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        spinner.set_message(format!("Pulling {image}..."));
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
         let options = CreateImageOptions {
             from_image: image,
             ..Default::default()
         };
 
         let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut layers_done = 0usize;
         while let Some(result) = stream.next().await {
-            result.map_err(LabError::Docker)?;
+            let info = result.map_err(LabError::Docker)?;
+            if let Some(status) = &info.status {
+                if status.contains("Pull complete") || status.contains("Already exists") {
+                    layers_done += 1;
+                    spinner.set_message(format!("Pulling {image}... ({layers_done} layers)"));
+                }
+            }
         }
 
+        spinner.finish_and_clear();
+        info!(image, "pulled image");
         Ok(())
     }
 
@@ -63,8 +92,17 @@ impl DockerClient {
         env: &IndexMap<String, String>,
         workdir: &str,
     ) -> Result<String> {
-        self.create_container_full(image, env, workdir, None, None)
-            .await
+        self.create_job_container(&CreateJobOpts {
+            image,
+            env,
+            workdir,
+            network: None,
+            entrypoint: None,
+            secrets_file: None,
+            cpus: None,
+            memory: None,
+        })
+        .await
     }
 
     /// Create a container on a specific network.
@@ -75,85 +113,56 @@ impl DockerClient {
         workdir: &str,
         network: Option<&str>,
     ) -> Result<String> {
-        self.create_container_full(image, env, workdir, network, None)
-            .await
+        self.create_job_container(&CreateJobOpts {
+            image,
+            env,
+            workdir,
+            network,
+            entrypoint: None,
+            secrets_file: None,
+            cpus: None,
+            memory: None,
+        })
+        .await
     }
 
-    /// Create a container with full options: network, entrypoint, and secrets file mount.
-    /// Ref: <https://docs.gitlab.com/ci/yaml/#image>
-    ///
-    /// Security: if `secrets_file` is provided, it's bind-mounted read-only at
-    /// `/run/secrets/env` instead of passing secrets as environment variables.
-    /// This prevents secrets from being visible via `docker inspect`.
-    pub async fn create_container_full(
-        &self,
-        image: &str,
-        env: &IndexMap<String, String>,
-        workdir: &str,
-        network: Option<&str>,
-        entrypoint: Option<&[String]>,
-    ) -> Result<String> {
-        self.create_container_secure(image, env, workdir, network, entrypoint, None)
-            .await
-    }
+    /// Create a job container with all options.
+    pub async fn create_job_container(&self, opts: &CreateJobOpts<'_>) -> Result<String> {
+        let mut env_vec: Vec<String> = opts.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
-    /// Create a container with optional secrets file mount.
-    pub async fn create_container_secure(
-        &self,
-        image: &str,
-        env: &IndexMap<String, String>,
-        workdir: &str,
-        network: Option<&str>,
-        entrypoint: Option<&[String]>,
-        secrets_file: Option<&str>,
-    ) -> Result<String> {
-        let mut env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-
-        let mut binds = vec![format!("{workdir}:/workspace")];
-        // Mount secrets file read-only if provided
-        if let Some(sf) = secrets_file {
+        let mut binds = vec![format!("{}:/workspace", opts.workdir)];
+        if let Some(sf) = opts.secrets_file {
             binds.push(format!("{sf}:/run/secrets/env:ro"));
         }
-        // Forward SSH agent for git operations (if available)
         if let Ok(ssh_sock) = std::env::var("SSH_AUTH_SOCK") {
             if std::path::Path::new(&ssh_sock).exists() {
                 binds.push(format!("{ssh_sock}:/ssh-agent:ro"));
                 env_vec.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
             }
         }
-        // Mount host Docker socket for DinD jobs.
-        // Locally, DinD service is replaced with host Docker — faster and no TLS complexity.
         if host_docker_socket_available() {
             binds.push("/var/run/docker.sock:/var/run/docker.sock".to_string());
             override_dind_env(&mut env_vec);
         }
 
-        // Docker Security Hardening (per OWASP Docker Security Cheat Sheet):
-        //
-        // RULE #3: Drop all capabilities, add back only what's needed
-        // RULE #4: Prevent in-container privilege escalation
-        // RULE #7: Limit resources to prevent DoS
-        // Local execution: no restrictions — use full laptop power for speed.
-        // Security is handled via secrets file mount + output masking, not container hardening.
         let host_config = HostConfig {
             binds: Some(binds),
-            network_mode: network.map(String::from),
+            network_mode: opts.network.map(String::from),
+            nano_cpus: opts.cpus.map(|c| (c * 1_000_000_000.0) as i64),
+            memory: opts.memory,
             ..Default::default()
         };
 
         let mut config = ContainerConfig {
-            image: Some(image.to_string()),
+            image: Some(opts.image.to_string()),
             env: Some(env_vec),
             working_dir: Some("/workspace".to_string()),
             host_config: Some(host_config),
-            // Note: containers run as root (needed for apk/apt package install).
-            // File ownership is fixed after job completes via chown.
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
             ..Default::default()
         };
 
-        // Wire image:entrypoint override
-        if let Some(ep) = entrypoint {
+        if let Some(ep) = opts.entrypoint {
             config.entrypoint = Some(ep.to_vec());
         }
 
@@ -163,7 +172,7 @@ impl DockerClient {
             .await
             .map_err(LabError::Docker)?;
 
-        debug!(id = %response.id, image, "container created");
+        debug!(id = %response.id, image = opts.image, "container created");
         Ok(response.id)
     }
 

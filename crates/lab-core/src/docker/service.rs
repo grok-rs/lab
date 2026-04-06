@@ -194,6 +194,15 @@ impl ServiceOrchestrator {
         let interval = Duration::from_secs(2);
         let start = std::time::Instant::now();
 
+        let spinner = indicatif::ProgressBar::new_spinner();
+        spinner.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("  {spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        spinner.set_message(format!("Waiting for service {}...", rs.hostname));
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
         while start.elapsed() < max_wait {
             match self
                 .docker
@@ -215,16 +224,17 @@ impl ServiceOrchestrator {
                             Some(status) => {
                                 let status_str = format!("{status:?}");
                                 if status_str.contains("HEALTHY") {
+                                    spinner.finish_and_clear();
                                     info!(service = %rs.hostname, "service healthy");
                                     return;
                                 } else if status_str.contains("UNHEALTHY") {
+                                    spinner.finish_and_clear();
                                     warn!(service = %rs.hostname, "service unhealthy");
                                     return;
                                 }
-                                // Starting — continue waiting
                             }
                             None => {
-                                // No health check — if running, assume ready
+                                spinner.finish_and_clear();
                                 debug!(service = %rs.hostname, "service running (no health check)");
                                 return;
                             }
@@ -238,6 +248,7 @@ impl ServiceOrchestrator {
             tokio::time::sleep(interval).await;
         }
 
+        spinner.finish_and_clear();
         warn!(service = %rs.hostname, "service readiness timeout after 60s");
     }
 }

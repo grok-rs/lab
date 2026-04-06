@@ -5,12 +5,9 @@ use tracing::{debug, info, warn};
 use crate::error::{LabError, Result};
 use crate::model::job::ArtifactConfig;
 
-/// Base directory for storing artifacts locally.
-const ARTIFACTS_DIR: &str = ".lab/artifacts";
-
 /// Get the artifacts directory for a specific job.
 pub fn job_artifacts_dir(workdir: &Path, job_name: &str) -> PathBuf {
-    workdir.join(ARTIFACTS_DIR).join(job_name)
+    crate::paths::artifacts_dir(workdir).join(job_name)
 }
 
 /// Collect artifacts from a container after a job completes.
@@ -175,7 +172,7 @@ pub async fn inject_artifacts(
 
 /// Clean up all artifacts after pipeline completes.
 pub fn cleanup_artifacts(workdir: &Path) {
-    let dir = workdir.join(ARTIFACTS_DIR);
+    let dir = crate::paths::artifacts_dir(workdir);
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }

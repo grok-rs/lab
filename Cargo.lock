@@ -1076,6 +1076,7 @@ dependencies = [
  "glob",
  "globset",
  "indexmap 2.13.1",
+ "indicatif",
  "regex",
  "reqwest",
  "serde",

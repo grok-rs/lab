@@ -14,9 +14,9 @@ pub struct Cli {
 pub enum Command {
     /// Run pipeline jobs locally in Docker containers.
     Run {
-        /// Specific job to run (runs all if omitted).
+        /// Job(s) to run (runs all if omitted). Specify multiple jobs to run them with their dependencies.
         #[arg()]
-        job: Option<String>,
+        jobs: Vec<String>,
 
         /// Run all jobs in a specific stage.
         #[arg(long)]
@@ -49,6 +49,14 @@ pub enum Command {
         #[arg(long)]
         privileged: bool,
 
+        /// Limit CPU for job containers (e.g., 1.5 for 1.5 cores).
+        #[arg(long)]
+        cpus: Option<f64>,
+
+        /// Limit memory for job containers (e.g., 512m, 2g).
+        #[arg(long)]
+        memory: Option<String>,
+
         /// Disable artifact passing between jobs.
         #[arg(long)]
         no_artifacts: bool,
@@ -77,11 +85,11 @@ pub enum Command {
         #[arg(long)]
         pull_secrets: bool,
 
-        /// Skip loading secrets from .lab/secrets.env.
+        /// Skip loading secrets from the centralized secrets store.
         #[arg(long)]
         no_secrets: bool,
 
-        /// Use a custom secrets file instead of .lab/secrets.env.
+        /// Use a custom secrets file instead of the centralized secrets store.
         #[arg(long = "secrets")]
         secrets_file: Option<PathBuf>,
 
@@ -93,6 +101,14 @@ pub enum Command {
         #[arg(long)]
         no_preflight: bool,
 
+        /// Clean up untracked files created by jobs after pipeline completes.
+        #[arg(long)]
+        clean: bool,
+
+        /// Re-run only jobs that failed in the last run.
+        #[arg(long)]
+        retry_failed: bool,
+
         /// Verbose output.
         #[arg(long)]
         verbose: bool,
@@ -103,6 +119,10 @@ pub enum Command {
         /// Path to .gitlab-ci.yml.
         #[arg(short, long, default_value = ".gitlab-ci.yml")]
         file: PathBuf,
+
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
     },
 
     /// Parse and validate .gitlab-ci.yml without running.
@@ -110,6 +130,10 @@ pub enum Command {
         /// Path to .gitlab-ci.yml.
         #[arg(short, long, default_value = ".gitlab-ci.yml")]
         file: PathBuf,
+
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
     },
 
     /// Show the job dependency graph.
@@ -117,6 +141,36 @@ pub enum Command {
         /// Path to .gitlab-ci.yml.
         #[arg(short, long, default_value = ".gitlab-ci.yml")]
         file: PathBuf,
+    },
+
+    /// Show detailed configuration for a specific job.
+    Explain {
+        /// Job name to explain.
+        #[arg()]
+        job: String,
+
+        /// Path to .gitlab-ci.yml.
+        #[arg(short, long, default_value = ".gitlab-ci.yml")]
+        file: PathBuf,
+    },
+
+    /// Watch for file changes and re-run pipeline jobs.
+    Watch {
+        /// Job(s) to run on change.
+        #[arg()]
+        jobs: Vec<String>,
+
+        /// Path to .gitlab-ci.yml.
+        #[arg(short, long, default_value = ".gitlab-ci.yml")]
+        file: PathBuf,
+
+        /// Simulate a pipeline event type.
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Poll interval in seconds.
+        #[arg(long, default_value = "3")]
+        interval: u64,
     },
 
     /// Analyze pipeline for security, performance, and best practice issues.
@@ -128,6 +182,17 @@ pub enum Command {
         /// Output format: text or json.
         #[arg(long, default_value = "text")]
         output: OutputFormat,
+    },
+
+    /// Browse or clean artifacts from previous job runs.
+    Artifacts {
+        /// Job name to list artifacts for (lists all jobs if omitted).
+        #[arg()]
+        job: Option<String>,
+
+        /// Remove all stored artifacts.
+        #[arg(long)]
+        clean: bool,
     },
 
     /// Drop into an interactive shell inside a job's container for debugging.

@@ -9,13 +9,18 @@ use crate::model::variables::{expand_variables, to_env_map};
 
 use super::job_context::JobContext;
 
+/// Output captured from a job run, for coverage extraction etc.
+pub struct JobOutput {
+    pub stdout: String,
+}
+
 /// Run a complete job: services + before_script + script + after_script.
 ///
 /// Ref: <https://docs.gitlab.com/ci/yaml/#script>
 /// Ref: <https://docs.gitlab.com/ci/yaml/#before_script>
 /// Ref: <https://docs.gitlab.com/ci/yaml/#after_script>
 /// Ref: <https://docs.gitlab.com/ci/services/>
-pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
+pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<JobOutput> {
     let image = &ctx.image;
     let env = to_env_map(&ctx.variables);
     let workdir = ctx
@@ -61,7 +66,7 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
     // Security: write secrets to a temp file and mount instead of passing as env vars.
     // This prevents `docker inspect` from revealing secret values.
     let secrets_tmpfile = if ctx.masker.has_values() {
-        let tmp_dir = workdir.join(".lab/tmp");
+        let tmp_dir = crate::paths::tmp_dir(&workdir);
         let _ = std::fs::create_dir_all(&tmp_dir);
         let secrets_path = tmp_dir.join(format!("secrets-{}.env", ctx.name));
         // Write secrets as KEY=VALUE, one per line
@@ -91,14 +96,16 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
     // Create job container
     let container_id = ctx
         .docker
-        .create_container_secure(
+        .create_job_container(&crate::docker::client::CreateJobOpts {
             image,
-            &env,
-            workdir_str,
-            network_name.as_deref(),
-            entrypoint.as_deref(),
-            secrets_tmpfile.as_ref().and_then(|p| p.to_str()),
-        )
+            env: &env,
+            workdir: workdir_str,
+            network: network_name.as_deref(),
+            entrypoint: entrypoint.as_deref(),
+            secrets_file: secrets_tmpfile.as_ref().and_then(|p| p.to_str()),
+            cpus: ctx.config.cpus,
+            memory: ctx.config.memory,
+        })
         .await?;
     ctx.container_id = Some(container_id.clone());
     ctx.docker.start_container(&container_id).await?;
@@ -171,6 +178,15 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
     )
     .await;
 
+    // Capture stdout for coverage extraction
+    let captured_stdout = match &main_result {
+        Ok(stdout) => stdout.clone(),
+        Err(_) => String::new(),
+    };
+    // Convert to unit result for downstream checks (artifacts:when, cache:when)
+    let main_ok = main_result.is_ok();
+    let main_err = main_result.err();
+
     // after_script (always runs, even on failure)
     if let Some(after) = &job.after_script {
         let after_commands: Vec<String> = after
@@ -188,8 +204,8 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
     if !ctx.config.no_artifacts {
         if let Some(artifact_config) = &job.artifacts {
             let should_collect = match &artifact_config.when_upload {
-                Some(crate::model::job::ArtifactWhen::OnSuccess) | None => main_result.is_ok(),
-                Some(crate::model::job::ArtifactWhen::OnFailure) => main_result.is_err(),
+                Some(crate::model::job::ArtifactWhen::OnSuccess) | None => main_ok,
+                Some(crate::model::job::ArtifactWhen::OnFailure) => !main_ok,
                 Some(crate::model::job::ArtifactWhen::Always) => true,
             };
             if should_collect {
@@ -211,7 +227,7 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
     // Save cache (respects cache:when)
     if !ctx.config.no_cache {
         if let Some(cache_configs) = &job.cache {
-            let job_succeeded = main_result.is_ok();
+            let job_succeeded = main_ok;
             if let Err(e) = cache::save_cache(
                 &container_id,
                 cache_configs,
@@ -261,7 +277,12 @@ pub async fn run_job(ctx: &mut JobContext, job: &Job) -> Result<()> {
         let _ = crate::docker::network::remove_network(ctx.docker.inner(), nid).await;
     }
 
-    main_result
+    match main_err {
+        Some(e) => Err(e),
+        None => Ok(JobOutput {
+            stdout: captured_stdout,
+        }),
+    }
 }
 
 /// Determine which jobs to download artifacts from.
@@ -289,13 +310,14 @@ fn get_artifact_dependencies(job: &Job) -> Vec<String> {
 /// Ref: <https://docs.gitlab.com/ci/yaml/#retry>
 /// Ref: <https://docs.gitlab.com/ci/yaml/#timeout>
 /// Ref: <https://docs.gitlab.com/ci/yaml/#retrywhen>
+/// Returns captured stdout on success for coverage extraction.
 async fn run_with_retry_and_timeout(
     ctx: &JobContext,
     container_id: &str,
     commands: &[String],
     retry_config: Option<&crate::model::job::RetryConfig>,
     timeout: Option<std::time::Duration>,
-) -> Result<()> {
+) -> Result<String> {
     let max_retries = retry_config.map(|r| r.max_retries()).unwrap_or(0);
     let mut last_err = None;
 
@@ -317,16 +339,14 @@ async fn run_with_retry_and_timeout(
         };
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(stdout) => return Ok(stdout),
             Err(ref e) => {
-                // Determine failure type for retry:when filtering
                 let failure_type = match e {
                     LabError::ContainerFailed { .. } => "script_failure",
                     LabError::Other(msg) if msg.contains("timed out") => "stuck_or_timeout_failure",
                     _ => "unknown_failure",
                 };
 
-                // Check if retry:when allows retrying this failure type
                 let should_retry = retry_config
                     .map(|r| r.should_retry(failure_type))
                     .unwrap_or(true);
@@ -351,12 +371,12 @@ async fn run_with_retry_and_timeout(
 /// - Each command is echoed before execution (like GitLab Runner's trace)
 ///
 /// Ref: <https://docs.gitlab.com/runner/executors/docker/#the-shells>
-async fn run_commands(ctx: &JobContext, container_id: &str, commands: &[String]) -> Result<()> {
+/// Returns captured stdout on success.
+async fn run_commands(ctx: &JobContext, container_id: &str, commands: &[String]) -> Result<String> {
     if commands.is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
 
-    // Generate shell script with proper error handling
     let script = generate_shell_script(commands);
     let shell = detect_shell(ctx, container_id).await;
 
@@ -384,7 +404,7 @@ async fn run_commands(ctx: &JobContext, container_id: &str, commands: &[String])
         });
     }
 
-    Ok(())
+    Ok(result.stdout)
 }
 
 /// Generate a shell script from commands.

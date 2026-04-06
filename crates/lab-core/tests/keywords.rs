@@ -921,7 +921,8 @@ c:
     );
     let pipeline = parse_pipeline(file.path()).unwrap();
     let vars = lab_core::model::variables::Variables::new();
-    let plan = build_plan(&pipeline.stages, &pipeline.jobs, &vars, Some("b"), None).unwrap();
+    let filter = vec!["b".to_string()];
+    let plan = build_plan(&pipeline.stages, &pipeline.jobs, &vars, Some(&filter), None).unwrap();
     let total: usize = plan.stages.iter().map(|s| s.jobs.len()).sum();
     assert_eq!(total, 1);
     assert_eq!(plan.stages[0].jobs[0].name, "b");

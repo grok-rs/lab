@@ -14,6 +14,8 @@ use crate::model::variables::Variables;
 const RESERVED_KEYWORDS: &[&str] = &[
     "default",
     "include",
+    "image",
+    "services",
     "stages",
     "variables",
     "workflow",
@@ -81,10 +83,25 @@ fn parse_global_variables(mapping: &serde_yaml::Mapping) -> Result<Variables> {
 
 fn parse_defaults(mapping: &serde_yaml::Mapping) -> Result<JobDefaults> {
     let key = Value::String("default".into());
-    match mapping.get(&key) {
-        Some(value) => serde_yaml::from_value(value.clone()).map_err(Into::into),
-        None => Ok(JobDefaults::default()),
+    let mut defaults: JobDefaults = match mapping.get(&key) {
+        Some(value) => serde_yaml::from_value(value.clone())?,
+        None => JobDefaults::default(),
+    };
+
+    // Global `image:` and `services:` act as defaults when not inside `default:` block
+    // Ref: <https://docs.gitlab.com/ci/yaml/#image>
+    if defaults.image.is_none() {
+        if let Some(img) = mapping.get(Value::String("image".into())) {
+            defaults.image = serde_yaml::from_value(img.clone()).ok();
+        }
     }
+    if defaults.services.is_none() {
+        if let Some(svc) = mapping.get(Value::String("services".into())) {
+            defaults.services = serde_yaml::from_value(svc.clone()).ok();
+        }
+    }
+
+    Ok(defaults)
 }
 
 fn parse_workflow(mapping: &serde_yaml::Mapping) -> Result<Option<WorkflowConfig>> {

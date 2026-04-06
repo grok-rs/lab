@@ -97,7 +97,7 @@ impl Runner {
             // Handle resource_group — mutual exclusion via lock file
             // Ref: <https://docs.gitlab.com/ci/yaml/#resource_group>
             let _resource_lock = if let Some(rg) = &job.resource_group {
-                let lock_dir = config.workdir.join(".lab/locks");
+                let lock_dir = crate::paths::locks_dir(&config.workdir);
                 let _ = std::fs::create_dir_all(&lock_dir);
                 let lock_path = lock_dir.join(format!("{rg}.lock"));
                 // Wait for lock (simple polling — adequate for local use)
@@ -208,11 +208,26 @@ impl Runner {
             info!(job = %job_name, stage = %job.stage, "starting job");
 
             // Build variables: predefined < global < scoped secrets < job-level
+            // Respect inherit:variables — filter global vars if job opts out
             let predefined = predefined_variables(&config, &job_name, &job.stage)?;
+            let inherited_globals = if let Some(ref inherit) = job.inherit {
+                use crate::model::job::InheritToggle;
+                match &inherit.variables {
+                    Some(InheritToggle::Bool(false)) => Variables::new(),
+                    Some(InheritToggle::List(list)) => global_vars
+                        .iter()
+                        .filter(|(k, _)| list.iter().any(|allowed| allowed == *k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    _ => global_vars.clone(),
+                }
+            } else {
+                global_vars.clone()
+            };
             let job_vars = merge_variables(&[
                 &predefined,
-                &global_vars,
-                &job_secrets, // Only secrets this job references
+                &inherited_globals,
+                &job_secrets,
                 &job.variables,
             ]);
 
@@ -241,19 +256,38 @@ impl Runner {
             let result = script::run_job(&mut job_ctx, &job).await;
             let duration = start.elapsed();
 
+            // Extract coverage if the job defines a coverage: regex
+            let coverage = match &result {
+                Ok(output) => job.coverage.as_ref().and_then(|pattern| {
+                    let cov = super::output::PipelineResult::extract_coverage(&output.stdout, pattern);
+                    if let Some(pct) = cov {
+                        info!(job = %job_name, coverage = %format!("{pct:.1}%"), "coverage extracted");
+                    }
+                    cov
+                }),
+                Err(_) => None,
+            };
+
             match &result {
-                Ok(()) => {
+                Ok(_) => {
                     info!(job = %job_name, duration = ?duration, "job succeeded");
-                    result_tracker.record(&job_name, &job.stage, JobStatus::Success, duration);
+                    result_tracker.record_with_coverage(
+                        &job_name,
+                        &job.stage,
+                        JobStatus::Success,
+                        duration,
+                        coverage,
+                    );
                 }
                 Err(e) => {
                     if job.allow_failure.is_allowed(1) {
                         warn!(job = %job_name, error = %e, duration = ?duration, "job failed (allowed)");
-                        result_tracker.record(
+                        result_tracker.record_with_coverage(
                             &job_name,
                             &job.stage,
                             JobStatus::AllowedFailure,
                             duration,
+                            coverage,
                         );
                         return Ok(());
                     }
@@ -266,7 +300,7 @@ impl Runner {
                 let _ = std::fs::remove_file(&lock_path);
             }
 
-            result
+            result.map(|_| ())
         })
     }
 

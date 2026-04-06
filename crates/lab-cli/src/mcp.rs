@@ -189,7 +189,7 @@ fn handle_tools_list(id: &Value) -> Value {
                 },
                 {
                     "name": "lab_secrets_pull",
-                    "description": "Pull CI/CD secrets from GitLab project and group variables via glab. Saves to .lab/secrets.env. Reports protected/hidden/masked variable status.",
+                    "description": "Pull CI/CD secrets from GitLab project and group variables via glab. Saves to centralized secrets store (~/.local/share/lab/). Reports protected/hidden/masked variable status.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -197,7 +197,7 @@ fn handle_tools_list(id: &Value) -> Value {
                 },
                 {
                     "name": "lab_secrets_init",
-                    "description": "Generate .lab/secrets.env.example template from pipeline variable references. Creates the secrets directory structure.",
+                    "description": "Generate secrets.env.example template in project root from pipeline variable references.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -440,13 +440,16 @@ fn tool_dry_run(file: &PathBuf, args: &Value) -> Result<String, String> {
     let secret_vars = secrets::load_secrets_file(&workdir).unwrap_or_default();
     let global_vars = merge_variables(&[&predefined, &pipeline.variables, &secret_vars]);
 
-    let job_filter = args.get("job").and_then(|j| j.as_str());
+    let job_filter: Option<Vec<String>> = args
+        .get("job")
+        .and_then(|j| j.as_str())
+        .map(|s| vec![s.to_string()]);
 
     let plan = build_plan(
         &pipeline.stages,
         &pipeline.jobs,
         &global_vars,
-        job_filter,
+        job_filter.as_deref(),
         None,
     )
     .map_err(|e| e.to_string())?;
@@ -576,7 +579,7 @@ fn tool_secrets_init(file: &PathBuf) -> Result<String, String> {
     let workdir = std::env::current_dir().map_err(|e| e.to_string())?;
     secrets::generate_secrets_example(&pipeline, &workdir).map_err(|e| e.to_string())?;
     Ok(json!({
-        "created": [".lab/secrets.env.example", ".lab/secrets.env"],
+        "created": ["secrets.env.example"],
         "message": "Secrets template generated. Run lab_secrets_pull to fetch from GitLab, or fill in values manually."
     })
     .to_string())

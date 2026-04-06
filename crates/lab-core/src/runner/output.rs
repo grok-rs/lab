@@ -21,6 +21,8 @@ pub struct JobResult {
     pub status: JobStatus,
     pub duration: Duration,
     pub coverage: Option<f64>,
+    /// Offset from pipeline start when this job began.
+    pub start_offset: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,7 @@ impl PipelineResult {
         coverage: Option<f64>,
     ) {
         let mut inner = self.inner.lock().unwrap();
+        let start_offset = inner.start_time.elapsed() - duration;
         inner.jobs.insert(
             name.to_string(),
             JobResult {
@@ -61,6 +64,7 @@ impl PipelineResult {
                 status,
                 duration,
                 coverage,
+                start_offset,
             },
         );
     }

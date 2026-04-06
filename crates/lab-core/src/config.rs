@@ -10,8 +10,8 @@ pub struct Config {
     /// Working directory (project root)
     pub workdir: PathBuf,
 
-    /// Specific job to run (None = run all)
-    pub job_filter: Option<String>,
+    /// Specific jobs to run (None = run all)
+    pub job_filter: Option<Vec<String>>,
 
     /// Specific stage to run (None = run all)
     pub stage_filter: Option<String>,
@@ -39,6 +39,12 @@ pub struct Config {
 
     /// How to handle manual jobs
     pub manual_mode: ManualMode,
+
+    /// CPU limit for containers (e.g., 1.5 = 1.5 cores).
+    pub cpus: Option<f64>,
+
+    /// Memory limit for containers (in bytes).
+    pub memory: Option<i64>,
 }
 
 /// How to handle `when: manual` jobs.
@@ -76,6 +82,8 @@ impl Default for Config {
             platform_overrides: HashMap::new(),
             max_parallel: num_cpus(),
             manual_mode: ManualMode::default(),
+            cpus: None,
+            memory: None,
         }
     }
 }
@@ -113,6 +121,13 @@ pub struct ProjectConfig {
     /// Platform overrides (job_name=image).
     #[serde(default)]
     pub platforms: HashMap<String, String>,
+
+    /// Local project path mappings for `include:project`.
+    /// Maps GitLab project paths to local filesystem paths,
+    /// avoiding API calls for locally cloned repos.
+    /// Example: `repo-level/cicd/gitlab-pipelines: /home/user/work/gitlab-pipelines`
+    #[serde(default)]
+    pub projects: HashMap<String, String>,
 }
 
 impl ProjectConfig {

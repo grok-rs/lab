@@ -19,7 +19,7 @@ pub fn build_plan(
     stages: &[String],
     jobs: &IndexMap<String, Job>,
     variables: &Variables,
-    job_filter: Option<&str>,
+    job_filter: Option<&[String]>,
     stage_filter: Option<&str>,
 ) -> Result<Plan> {
     // Step 1: Evaluate rules and determine which jobs will run
@@ -47,15 +47,15 @@ pub fn build_plan(
 fn filter_active_jobs(
     jobs: &IndexMap<String, Job>,
     variables: &Variables,
-    job_filter: Option<&str>,
+    job_filter: Option<&[String]>,
     stage_filter: Option<&str>,
 ) -> Result<IndexMap<String, Job>> {
     let mut active = IndexMap::new();
 
     for (name, job) in jobs {
         // Apply user filters
-        if let Some(filter) = job_filter {
-            if name != filter {
+        if let Some(filters) = job_filter {
+            if !filters.iter().any(|f| f == name) {
                 continue;
             }
         }
@@ -478,7 +478,8 @@ mod tests {
         jobs.insert("test_a".to_string(), job("test"));
         jobs.insert("test_b".to_string(), job("test"));
 
-        let plan = build_plan(&stages, &jobs, &Variables::new(), Some("test_a"), None).unwrap();
+        let filter = vec!["test_a".to_string()];
+        let plan = build_plan(&stages, &jobs, &Variables::new(), Some(&filter), None).unwrap();
         assert_eq!(plan.stages[0].jobs.len(), 1);
         assert_eq!(plan.stages[0].jobs[0].name, "test_a");
     }

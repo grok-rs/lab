@@ -15,13 +15,47 @@ use lab_core::planner::build_plan;
 use lab_core::runner::Runner;
 use lab_core::secrets;
 
+/// Check that required tools are available before running.
+fn check_tools() -> Result<()> {
+    // Docker daemon
+    let docker = std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output();
+    match docker {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            anyhow::bail!(
+                "Docker daemon is not running.\n  Error: {}\n  Fix: start Docker Desktop or run `sudo systemctl start docker`",
+                stderr.trim()
+            );
+        }
+        Err(_) => {
+            anyhow::bail!(
+                "docker not found.\n  Fix: install Docker — https://docs.docker.com/get-docker/"
+            );
+        }
+    }
+
+    // Git
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        anyhow::bail!("git not found.\n  Fix: install git — https://git-scm.com/downloads");
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Run {
-            job,
+            jobs,
             stage,
             file,
             mut variables,
@@ -29,6 +63,8 @@ async fn main() -> Result<()> {
             tag,
             pull_policy,
             privileged,
+            cpus,
+            memory,
             no_artifacts,
             no_cache,
             platforms,
@@ -40,9 +76,12 @@ async fn main() -> Result<()> {
             secrets_file,
             dry_run,
             no_preflight,
+            clean,
+            retry_failed,
             verbose,
         } => {
             logging::init(verbose);
+            check_tools()?;
 
             // Handle --tag shorthand: simulates a tag push pipeline
             if let Some(tag_value) = &tag {
@@ -118,10 +157,37 @@ async fn main() -> Result<()> {
             let workdir = std::env::current_dir()?;
             let project_config = lab_core::config::ProjectConfig::load(&workdir);
 
+            let job_filter = if retry_failed {
+                // Load failed job names from last run
+                let last_run = lab_core::paths::last_run_file(&workdir);
+                if last_run.exists() {
+                    let content = std::fs::read_to_string(&last_run)
+                        .context("failed to read last run file")?;
+                    let failed: Vec<String> =
+                        serde_json::from_str(&content).context("failed to parse last run file")?;
+                    if failed.is_empty() {
+                        println!("No failed jobs in last run.");
+                        return Ok(());
+                    }
+                    println!(
+                        "Retrying {} failed job(s): {}",
+                        style(failed.len()).cyan().bold(),
+                        failed.join(", ")
+                    );
+                    Some(failed)
+                } else {
+                    anyhow::bail!("no previous run found — run the pipeline first");
+                }
+            } else if jobs.is_empty() {
+                None
+            } else {
+                Some(jobs)
+            };
+
             let mut config = Config {
                 ci_file: file.clone(),
                 workdir: workdir.clone(),
-                job_filter: job,
+                job_filter,
                 stage_filter: stage,
                 variables: variables.into_iter().collect(),
                 pull_policy: PullPolicy::from(pull_policy),
@@ -134,6 +200,8 @@ async fn main() -> Result<()> {
                         .map(|n| n.get())
                         .unwrap_or(4)
                 }),
+                cpus,
+                memory: memory.as_deref().map(parse_memory_string).transpose()?,
                 manual_mode: if approve_manual {
                     lab_core::config::ManualMode::Approve
                 } else if skip_manual {
@@ -145,10 +213,15 @@ async fn main() -> Result<()> {
 
             project_config.apply_to(&mut config);
 
+            // Configure local project path mappings for include:project resolution
+            if !project_config.projects.is_empty() {
+                lab_core::parser::resolver::set_project_mappings(project_config.projects.clone());
+            }
+
             let pipeline = parse_pipeline(&file).context("failed to parse pipeline")?;
 
             // Load secrets
-            let secret_vars = if no_secrets {
+            let mut secret_vars = if no_secrets {
                 lab_core::model::variables::Variables::new()
             } else if pull_secrets {
                 // Pull fresh from GitLab
@@ -257,13 +330,49 @@ async fn main() -> Result<()> {
                 let missing_count = display::print_preflight_report(&plan, &global_vars);
 
                 if missing_count > 0 {
-                    eprint!("Continue anyway? [y/N] ");
+                    eprintln!(
+                        "  [{}] Pull secrets from GitLab    [{}] Continue anyway    [{}] Abort",
+                        style("p").cyan().bold(),
+                        style("c").yellow().bold(),
+                        style("a").red().bold(),
+                    );
+                    eprint!("\n  Choice: ");
                     let mut input = String::new();
-                    if std::io::stdin().read_line(&mut input).is_ok()
-                        && !input.trim().eq_ignore_ascii_case("y")
-                    {
-                        println!("Aborted.");
-                        return Ok(());
+                    let _ = std::io::stdin().read_line(&mut input);
+                    match input.trim().to_lowercase().as_str() {
+                        "p" => {
+                            println!();
+                            println!("Pulling secrets from GitLab...");
+                            match secrets::pull_secrets_from_gitlab(&workdir) {
+                                Ok(pulled) => {
+                                    let count = pulled.len();
+                                    if let Err(e) = secrets::save_secrets_file(&workdir, &pulled) {
+                                        eprintln!("Warning: failed to save secrets: {e}");
+                                    }
+                                    // Merge pulled secrets into global vars
+                                    for (k, v) in &pulled {
+                                        global_vars.entry(k.clone()).or_insert_with(|| v.clone());
+                                    }
+                                    secret_vars = pulled;
+                                    println!(
+                                        "{} {} secret(s) loaded\n",
+                                        style("✓").green().bold(),
+                                        count
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{} Failed to pull secrets: {e}\n",
+                                        style("✗").red().bold()
+                                    );
+                                }
+                            }
+                        }
+                        "c" | "y" => {} // continue
+                        _ => {
+                            println!("Aborted.");
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -276,6 +385,9 @@ async fn main() -> Result<()> {
                 println!("  {} secret(s) loaded", style(secret_vars.len()).cyan());
             }
             println!();
+
+            // Snapshot untracked files before running (for cleanup detection)
+            let pre_untracked = get_untracked_files(&workdir);
 
             // Run with signal handling
             let runner = Runner::with_secrets(config, global_vars, secret_vars)
@@ -291,27 +403,234 @@ async fn main() -> Result<()> {
 
             display::print_pipeline_summary(runner.result());
 
+            // Save failed job names for --retry-failed
+            {
+                let failed_jobs: Vec<String> = runner
+                    .result()
+                    .jobs()
+                    .iter()
+                    .filter(|j| j.status == lab_core::runner::output::JobStatus::Failed)
+                    .map(|j| j.name.clone())
+                    .collect();
+                let run_file = lab_core::paths::last_run_file(&workdir);
+                if let Some(parent) = run_file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(
+                    &run_file,
+                    serde_json::to_string(&failed_jobs).unwrap_or_default(),
+                );
+            }
+
+            // Detect files created by job execution
+            let post_untracked = get_untracked_files(&workdir);
+            let new_files: Vec<String> = post_untracked
+                .into_iter()
+                .filter(|f| !pre_untracked.contains(f))
+                .collect();
+
+            if !new_files.is_empty() {
+                println!();
+                if clean {
+                    println!(
+                        "{} Cleaning {} file(s)/dir(s) created by jobs:",
+                        style("⟳").cyan().bold(),
+                        new_files.len()
+                    );
+                    for f in &new_files {
+                        let path = workdir.join(f);
+                        if path.is_dir() {
+                            let _ = std::fs::remove_dir_all(&path);
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        println!("    {} {}", style("✗").red(), style(f).dim());
+                    }
+                } else {
+                    println!(
+                        "{} {} file(s)/dir(s) created by jobs (use {} to auto-remove):",
+                        style("!").yellow().bold(),
+                        new_files.len(),
+                        style("--clean").cyan(),
+                    );
+                    for f in &new_files {
+                        println!("    {} {}", style("·").dim(), style(f).yellow());
+                    }
+                }
+            }
+
             if let Some(err) = pipeline_err {
+                display::print_error_suggestions(&err);
                 cleanup_docker_resources().await;
                 return Err(err).context("pipeline failed");
             }
         }
 
-        Command::List { file } => {
-            let pipeline = parse_pipeline(&file).context("failed to parse pipeline")?;
-            display::print_pipeline_list(&pipeline);
+        Command::Artifacts { job, clean } => {
+            let workdir = std::env::current_dir()?;
+            let artifacts_base = lab_core::paths::artifacts_dir(&workdir);
+
+            if clean {
+                if artifacts_base.exists() {
+                    std::fs::remove_dir_all(&artifacts_base)?;
+                    println!("{} Artifacts cleaned", style("✓").green().bold());
+                } else {
+                    println!("No artifacts to clean.");
+                }
+                return Ok(());
+            }
+
+            if !artifacts_base.exists() {
+                println!("No artifacts found. Run a pipeline first.");
+                return Ok(());
+            }
+
+            let entries: Vec<_> = std::fs::read_dir(&artifacts_base)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    job.as_ref()
+                        .map(|j| e.file_name().to_string_lossy() == *j)
+                        .unwrap_or(true)
+                })
+                .collect();
+
+            if entries.is_empty() {
+                println!(
+                    "No artifacts found{}.",
+                    job.as_ref()
+                        .map(|j| format!(" for job '{j}'"))
+                        .unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            println!("{}", style("Artifacts:").bold());
+            println!();
+
+            for entry in entries {
+                let job_name = entry.file_name().to_string_lossy().to_string();
+                let job_dir = entry.path();
+                let mut total_size: u64 = 0;
+                let mut file_count: usize = 0;
+
+                fn walk_dir(
+                    dir: &std::path::Path,
+                    base: &std::path::Path,
+                    total_size: &mut u64,
+                    file_count: &mut usize,
+                    files: &mut Vec<(String, u64)>,
+                ) {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                walk_dir(&path, base, total_size, file_count, files);
+                            } else if let Ok(meta) = path.metadata() {
+                                let rel = path.strip_prefix(base).unwrap_or(&path);
+                                let size = meta.len();
+                                *total_size += size;
+                                *file_count += 1;
+                                files.push((rel.display().to_string(), size));
+                            }
+                        }
+                    }
+                }
+
+                let mut files = Vec::new();
+                walk_dir(
+                    &job_dir,
+                    &job_dir,
+                    &mut total_size,
+                    &mut file_count,
+                    &mut files,
+                );
+
+                println!(
+                    "  {} {} — {} file(s), {}",
+                    style("●").green(),
+                    style(&job_name).bold(),
+                    file_count,
+                    format_size(total_size),
+                );
+
+                for (path, size) in &files {
+                    println!(
+                        "      {} {}",
+                        style(path).dim(),
+                        style(format_size(*size)).dim(),
+                    );
+                }
+            }
         }
 
-        Command::Validate { file } => match parse_pipeline(&file) {
-            Ok(pipeline) => {
-                println!(
-                    "Valid: {} stages, {} jobs",
-                    pipeline.stages.len(),
-                    pipeline.jobs.len()
-                );
+        Command::List { file, output } => {
+            let pipeline = parse_pipeline(&file).context("failed to parse pipeline")?;
+            match output {
+                cli::OutputFormat::Json => {
+                    let data: Vec<serde_json::Value> = pipeline
+                        .jobs
+                        .iter()
+                        .map(|(name, job)| {
+                            serde_json::json!({
+                                "name": name,
+                                "stage": job.stage,
+                                "image": job.image.as_ref().map(|i| i.name()),
+                                "needs": job.needs.as_ref().map(|n| n.iter().map(|d| d.job_name()).collect::<Vec<_>>()),
+                                "when": format!("{:?}", job.when),
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "stages": pipeline.stages,
+                            "jobs": data,
+                        }))
+                        .unwrap()
+                    );
+                }
+                cli::OutputFormat::Text => {
+                    display::print_pipeline_list(&pipeline);
+                }
             }
+        }
+
+        Command::Validate { file, output } => match parse_pipeline(&file) {
+            Ok(pipeline) => match output {
+                cli::OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "valid": true,
+                            "stages": pipeline.stages.len(),
+                            "jobs": pipeline.jobs.len(),
+                        })
+                    );
+                }
+                cli::OutputFormat::Text => {
+                    println!(
+                        "Valid: {} stages, {} jobs",
+                        pipeline.stages.len(),
+                        pipeline.jobs.len()
+                    );
+                }
+            },
             Err(e) => {
-                eprintln!("Invalid: {e}");
+                match output {
+                    cli::OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "valid": false,
+                                "error": e.to_string(),
+                            })
+                        );
+                    }
+                    cli::OutputFormat::Text => {
+                        eprintln!("Invalid: {e}");
+                    }
+                }
                 std::process::exit(1);
             }
         },
@@ -319,6 +638,186 @@ async fn main() -> Result<()> {
         Command::Graph { file } => {
             let pipeline = parse_pipeline(&file).context("failed to parse pipeline")?;
             display::print_dependency_graph(&pipeline);
+        }
+
+        Command::Explain { job, file } => {
+            let pipeline = parse_pipeline(&file).context("failed to parse pipeline")?;
+            let j = pipeline
+                .jobs
+                .get(&job)
+                .ok_or_else(|| anyhow::anyhow!("job '{job}' not found"))?;
+
+            println!("{}", style(format!("Job: {job}")).bold());
+            println!();
+            println!("  {}  {}", style("Stage:").dim(), j.stage);
+            println!(
+                "  {}  {}",
+                style("Image:").dim(),
+                j.image.as_ref().map(|i| i.name()).unwrap_or("(default)")
+            );
+            println!("  {}   {:?}", style("When:").dim(), j.when);
+            if let Some(timeout) = j.timeout {
+                println!("  {} {}s", style("Timeout:").dim(), timeout.as_secs());
+            }
+            if let Some(retry) = &j.retry {
+                println!("  {}  max {}", style("Retry:").dim(), retry.max_retries());
+            }
+            if let Some(coverage) = &j.coverage {
+                println!("  {} {}", style("Coverage:").dim(), coverage);
+            }
+            if let Some(rg) = &j.resource_group {
+                println!("  {} {}", style("Resource group:").dim(), rg);
+            }
+
+            if let Some(needs) = &j.needs {
+                println!();
+                println!("  {}", style("Dependencies:").dim());
+                for n in needs {
+                    let opt = if n.is_optional() { " (optional)" } else { "" };
+                    let art = if !n.wants_artifacts() {
+                        " (no artifacts)"
+                    } else {
+                        ""
+                    };
+                    println!("    {} {}{}{}", style("→").dim(), n.job_name(), opt, art);
+                }
+            }
+
+            if let Some(services) = &j.services {
+                println!();
+                println!("  {}", style("Services:").dim());
+                for svc in services {
+                    println!("    {} {}", style("●").cyan(), svc.image_name());
+                }
+            }
+
+            if !j.variables.is_empty() {
+                println!();
+                println!("  {}", style("Variables:").dim());
+                for (k, v) in &j.variables {
+                    println!("    {}={}", style(k).green(), v.value());
+                }
+            }
+
+            if let Some(rules) = &j.rules {
+                println!();
+                println!("  {}", style("Rules:").dim());
+                for rule in rules {
+                    if let Some(expr) = &rule.if_expr {
+                        let when = rule.when.map(|w| format!(" → {w:?}")).unwrap_or_default();
+                        println!("    {} if: {}{}", style("·").dim(), expr, style(when).dim());
+                    }
+                    if rule.changes.is_some() {
+                        println!("    {} changes: [...]", style("·").dim());
+                    }
+                    if rule.exists.is_some() {
+                        println!("    {} exists: [...]", style("·").dim());
+                    }
+                }
+            }
+
+            println!();
+            println!("  {}", style("Script:").dim());
+            if let Some(before) = &j.before_script {
+                for cmd in before {
+                    println!("    {} {}", style("(before)").dim(), cmd);
+                }
+            }
+            for cmd in &j.script {
+                println!("    {}", cmd);
+            }
+            if let Some(after) = &j.after_script {
+                for cmd in after {
+                    println!("    {} {}", style("(after)").dim(), cmd);
+                }
+            }
+        }
+
+        Command::Watch {
+            jobs,
+            file,
+            event,
+            interval,
+        } => {
+            println!(
+                "{} Watching {} for changes (every {}s)...",
+                style("⟳").cyan().bold(),
+                file.display(),
+                interval,
+            );
+
+            let mut last_modified = file.metadata().ok().and_then(|m| m.modified().ok());
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+                let current = file.metadata().ok().and_then(|m| m.modified().ok());
+
+                if current != last_modified {
+                    last_modified = current;
+                    println!();
+                    println!(
+                        "{} Change detected — re-parsing...",
+                        style("⟳").cyan().bold()
+                    );
+
+                    // Validate first
+                    match parse_pipeline(&file) {
+                        Ok(pipeline) => {
+                            println!(
+                                "{} Valid: {} stages, {} jobs",
+                                style("✓").green().bold(),
+                                pipeline.stages.len(),
+                                pipeline.jobs.len()
+                            );
+
+                            // If jobs specified, do a dry run
+                            if !jobs.is_empty() {
+                                let workdir = std::env::current_dir()?;
+                                let predefined = lab_core::model::variables::predefined_variables(
+                                    &Config::default(),
+                                    "",
+                                    "",
+                                )
+                                .unwrap_or_default();
+                                let mut vars = merge_variables(&[&predefined, &pipeline.variables]);
+                                if let Some(evt) = &event {
+                                    vars.insert(
+                                        "CI_PIPELINE_SOURCE".into(),
+                                        lab_core::model::variables::VariableValue::Simple(
+                                            evt.clone(),
+                                        ),
+                                    );
+                                }
+                                let secret_vars =
+                                    secrets::load_secrets_file(&workdir).unwrap_or_default();
+                                let vars = merge_variables(&[&vars, &secret_vars]);
+
+                                let filter = jobs.clone();
+                                match lab_core::planner::build_plan(
+                                    &pipeline.stages,
+                                    &pipeline.jobs,
+                                    &vars,
+                                    Some(&filter),
+                                    None,
+                                ) {
+                                    Ok(plan) => {
+                                        let n: usize =
+                                            plan.stages.iter().map(|s| s.jobs.len()).sum();
+                                        println!("  {} {} job(s) matched", style("→").dim(), n);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("{} Plan error: {e}", style("✗").red().bold());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} Parse error: {e}", style("✗").red().bold());
+                        }
+                    }
+                }
+            }
         }
 
         Command::Analyze { file, output } => {
@@ -472,10 +971,12 @@ async fn main() -> Result<()> {
                     secrets::save_secrets_file(&workdir, &result.included)
                         .context("failed to save secrets")?;
 
+                    let secrets_path = secrets::secrets_file_path(&workdir);
                     println!(
-                        "\n{} {} secret(s) saved to .lab/secrets.env",
+                        "\n{} {} secret(s) saved to {}",
                         style("✓").green().bold(),
-                        result.included.len()
+                        result.included.len(),
+                        style(secrets_path.display()).cyan()
                     );
 
                     if !result.masked_keys.is_empty() {
@@ -499,7 +1000,7 @@ async fn main() -> Result<()> {
 
                     if !result.skipped_hidden.is_empty() {
                         println!(
-                            "  {} {} hidden variable(s) — add manually to .lab/secrets.env",
+                            "  {} {} hidden variable(s) — add manually to secrets file",
                             style("⊘").red(),
                             result.skipped_hidden.len()
                         );
@@ -573,19 +1074,11 @@ async fn main() -> Result<()> {
                     secrets::generate_secrets_example(&pipeline, &workdir)
                         .context("failed to generate secrets example")?;
 
-                    println!(
-                        "{} Created .lab/secrets.env.example",
-                        style("✓").green().bold()
-                    );
-                    println!(
-                        "{} Created .lab/secrets.env (add your secrets here)",
-                        style("✓").green().bold()
-                    );
+                    println!("{} Created secrets.env.example", style("✓").green().bold());
                     println!(
                         "\nFor DevOps: run {} to fetch from GitLab",
                         style("lab secrets pull").cyan()
                     );
-                    println!("For Devs:   copy .lab/secrets.env.example to .lab/secrets.env");
                 }
             }
         }
@@ -784,6 +1277,46 @@ fn print_performance_report(jobs: &[serde_json::Value]) {
             );
         }
     }
+}
+
+fn parse_memory_string(s: &str) -> anyhow::Result<i64> {
+    let s = s.trim().to_lowercase();
+    if let Some(num) = s.strip_suffix('g') {
+        Ok(num.parse::<f64>()? as i64 * 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix('m') {
+        Ok(num.parse::<f64>()? as i64 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix('k') {
+        Ok(num.parse::<f64>()? as i64 * 1024)
+    } else {
+        Ok(s.parse::<i64>()?)
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Get untracked files/dirs in the git working directory (top-level entries only).
+fn get_untracked_files(workdir: &std::path::Path) -> std::collections::HashSet<String> {
+    std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "--directory"])
+        .current_dir(workdir)
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim_end_matches('/').to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Clean up any leftover lab Docker containers and networks.

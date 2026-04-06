@@ -10,25 +10,65 @@ pub type Variables = IndexMap<String, VariableValue>;
 
 /// A CI/CD variable value with optional metadata.
 /// Ref: <https://docs.gitlab.com/ci/yaml/#variables>
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum VariableValue {
     /// Simple string value.
     Simple(String),
     /// Detailed variable with description and options.
     Detailed {
         value: String,
-        #[serde(default)]
         description: Option<String>,
-        #[serde(default = "default_true")]
         expand: bool,
-        #[serde(default)]
         options: Option<Vec<String>>,
     },
 }
 
-fn default_true() -> bool {
-    true
+impl<'de> Deserialize<'de> for VariableValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match &value {
+            serde_yaml::Value::String(s) => Ok(VariableValue::Simple(s.clone())),
+            serde_yaml::Value::Number(n) => Ok(VariableValue::Simple(n.to_string())),
+            serde_yaml::Value::Bool(b) => Ok(VariableValue::Simple(b.to_string())),
+            serde_yaml::Value::Null => Ok(VariableValue::Simple(String::new())),
+            serde_yaml::Value::Mapping(m) => {
+                let val = m
+                    .get(serde_yaml::Value::String("value".into()))
+                    .and_then(|v| match v {
+                        serde_yaml::Value::String(s) => Some(s.clone()),
+                        serde_yaml::Value::Number(n) => Some(n.to_string()),
+                        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let description = m
+                    .get(serde_yaml::Value::String("description".into()))
+                    .and_then(|v| v.as_str().map(String::from));
+                let expand = m
+                    .get(serde_yaml::Value::String("expand".into()))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let options = m
+                    .get(serde_yaml::Value::String("options".into()))
+                    .and_then(|v| v.as_sequence())
+                    .map(|seq| {
+                        seq.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+                Ok(VariableValue::Detailed {
+                    value: val,
+                    description,
+                    expand,
+                    options,
+                })
+            }
+            _ => Err(serde::de::Error::custom("invalid variable value")),
+        }
+    }
 }
 
 impl VariableValue {

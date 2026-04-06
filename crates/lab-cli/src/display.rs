@@ -2,7 +2,7 @@ use console::style;
 use lab_core::analyze::{Finding, Severity};
 use lab_core::model::pipeline::{Pipeline, Plan};
 use lab_core::model::variables::Variables;
-use lab_core::runner::output::{JobStatus, PipelineResult};
+use lab_core::runner::output::{JobResult, JobStatus, PipelineResult};
 
 /// Print pipeline jobs grouped by stage.
 pub fn print_pipeline_list(pipeline: &Pipeline) {
@@ -53,37 +53,196 @@ pub fn print_pipeline_list(pipeline: &Pipeline) {
 
 /// Print the dependency graph in a simple text format.
 pub fn print_dependency_graph(pipeline: &Pipeline) {
-    println!("{}", style("Job dependency graph:").bold());
-    println!();
+    use std::collections::{HashMap, HashSet};
 
+    // Group jobs by stage, preserving stage order
+    let mut stage_jobs: Vec<(&str, Vec<&str>)> = Vec::new();
+    for stage_name in &pipeline.stages {
+        let jobs: Vec<&str> = pipeline
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.stage == *stage_name)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !jobs.is_empty() {
+            stage_jobs.push((stage_name, jobs));
+        }
+    }
+
+    if stage_jobs.is_empty() {
+        println!("No jobs in pipeline.");
+        return;
+    }
+
+    // Collect dependency edges: from → [to, ...]
+    let mut deps_from: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut deps_to: HashMap<&str, Vec<&str>> = HashMap::new();
     for (name, job) in &pipeline.jobs {
-        let deps = job
-            .needs
-            .as_ref()
-            .map(|n| {
-                n.iter()
-                    .map(|need| need.job_name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        if deps.is_empty() {
-            println!(
-                "  {} {}",
-                style(name).green(),
-                style(format!("(stage: {})", job.stage)).dim()
-            );
-        } else {
-            for dep in &deps {
-                println!(
-                    "  {} {} {}",
-                    style(dep).dim(),
-                    style("->").dim(),
-                    style(name).green()
-                );
+        if let Some(needs) = &job.needs {
+            for need in needs {
+                deps_from
+                    .entry(need.job_name())
+                    .or_default()
+                    .push(name.as_str());
+                deps_to
+                    .entry(name.as_str())
+                    .or_default()
+                    .push(need.job_name());
             }
         }
     }
+
+    // Jobs that feed into the next stage
+    let feeds_next: HashSet<&str> = deps_from.keys().copied().collect();
+    // Jobs that receive from previous stage
+    let receives: HashSet<&str> = deps_to.keys().copied().collect();
+
+    // Max job name length for consistent box widths
+    let max_name_len = pipeline.jobs.keys().map(|n| n.len()).max().unwrap_or(10);
+    let box_inner = max_name_len + 2; // padding inside box
+    let box_outer = box_inner + 2; // + border chars
+
+    for (stage_idx, (stage_name, jobs)) in stage_jobs.iter().enumerate() {
+        // ── Stage header ──
+        let label = format!(" {} ", stage_name);
+        let rule_len =
+            (box_outer * jobs.len().min(4) + (jobs.len().min(4) - 1) * 3).max(label.len() + 4);
+        let left = (rule_len - label.len()) / 2;
+        let right = rule_len - label.len() - left;
+        println!(
+            "  {}{}{}  {}",
+            style("─".repeat(left)).dim(),
+            style(&label).bold().cyan(),
+            style("─".repeat(right)).dim(),
+            style(if jobs.len() > 1 { "parallel" } else { "single" }).dim(),
+        );
+        println!();
+
+        // ── Job boxes ──
+        // Render in rows of up to 4 jobs
+        for chunk in jobs.chunks(4) {
+            // Top border
+            let top: String = chunk
+                .iter()
+                .map(|_| format!("  ┌{}┐", "─".repeat(box_inner)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{top}");
+
+            // Job name + annotations
+            let mid: String = chunk
+                .iter()
+                .map(|&job_name| {
+                    let job = &pipeline.jobs[job_name];
+                    // Pick icon based on when/type
+                    let icon = if job.when == lab_core::model::job::When::Manual {
+                        "⏸"
+                    } else if feeds_next.contains(job_name) && receives.contains(job_name) {
+                        "◆"
+                    } else if feeds_next.contains(job_name) {
+                        "●"
+                    } else if receives.contains(job_name) {
+                        "◀"
+                    } else {
+                        "○"
+                    };
+                    let padded = format!("{} {:width$}", icon, job_name, width = max_name_len);
+                    let styled = if receives.contains(job_name) && feeds_next.contains(job_name) {
+                        format!("{}", style(&padded).cyan())
+                    } else if feeds_next.contains(job_name) {
+                        format!("{}", style(&padded).green())
+                    } else if receives.contains(job_name) {
+                        format!("{}", style(&padded).yellow())
+                    } else if job.when == lab_core::model::job::When::Manual {
+                        format!("{}", style(&padded).dim())
+                    } else {
+                        format!("{}", style(&padded).white())
+                    };
+                    format!("  │{styled}│")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{mid}");
+
+            // Image line
+            let img_line: String = chunk
+                .iter()
+                .map(|&job_name| {
+                    let job = &pipeline.jobs[job_name];
+                    let img = job.image.as_ref().map(|i| i.name()).unwrap_or("-");
+                    // Truncate long image names
+                    let truncated = if img.len() > max_name_len {
+                        format!("{}…", &img[..max_name_len - 1])
+                    } else {
+                        img.to_string()
+                    };
+                    let padded = format!("  {:width$}", truncated, width = max_name_len);
+                    format!("  │{}│", style(&padded).dim())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{img_line}");
+
+            // Bottom border
+            let bot: String = chunk
+                .iter()
+                .map(|_| format!("  └{}┘", "─".repeat(box_inner)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{bot}");
+        }
+
+        // ── Dependency arrows between this stage and the next ──
+        if stage_idx < stage_jobs.len() - 1 {
+            // Find jobs in this stage that feed into the next stage
+            let connectors: Vec<&str> = jobs
+                .iter()
+                .filter(|j| feeds_next.contains(**j))
+                .copied()
+                .collect();
+
+            if connectors.is_empty() {
+                // Pure stage ordering, no explicit needs
+                println!("  {}", style("    │").dim());
+                println!("  {}", style("    ▼").dim());
+            } else {
+                println!();
+                for &from in &connectors {
+                    if let Some(targets) = deps_from.get(from) {
+                        let target_list = targets
+                            .iter()
+                            .map(|t| format!("{}", style(t).yellow()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!(
+                            "  {} {} {} {}",
+                            style("    ╰──").dim(),
+                            style(from).green(),
+                            style("→").bold(),
+                            target_list,
+                        );
+                    }
+                }
+                println!("  {}", style("    │").dim());
+                println!("  {}", style("    ▼").dim());
+            }
+            println!();
+        }
+    }
+
+    // ── Legend ──
+    println!();
+    println!(
+        "  {} {}  {} {}  {} {}  {} {}",
+        style("●").green(),
+        style("upstream").dim(),
+        style("◀").yellow(),
+        style("has deps").dim(),
+        style("◆").cyan(),
+        style("both").dim(),
+        style("⏸").white(),
+        style("manual").dim(),
+    );
 }
 
 /// Print a summary of the pipeline run with colored status indicators.
@@ -136,6 +295,11 @@ pub fn print_pipeline_summary(result: &PipelineResult) {
         .filter(|j| j.status == JobStatus::AllowedFailure)
         .count();
 
+    // Timeline visualization
+    if jobs.len() > 1 {
+        print_timeline(&jobs, total);
+    }
+
     println!();
     if failed == 0 {
         print!("{}", style("Pipeline passed").green().bold());
@@ -153,6 +317,69 @@ pub fn print_pipeline_summary(result: &PipelineResult) {
         );
     }
     println!(" in {}", format_duration(total));
+}
+
+/// Print a Gantt-style timeline showing job execution over time.
+fn print_timeline(jobs: &[JobResult], total: std::time::Duration) {
+    let total_secs = total.as_secs_f64().max(1.0);
+    let bar_width: usize = 50;
+    let max_name = jobs.iter().map(|j| j.name.len()).max().unwrap_or(10);
+
+    println!();
+    println!("{}", style("Timeline:").bold());
+    println!();
+
+    for job in jobs {
+        let start_frac = job.start_offset.as_secs_f64() / total_secs;
+        let dur_frac = job.duration.as_secs_f64() / total_secs;
+
+        let start_col = (start_frac * bar_width as f64) as usize;
+        let dur_cols = ((dur_frac * bar_width as f64) as usize).max(1);
+        let end_col = (start_col + dur_cols).min(bar_width);
+
+        let bar_char = match job.status {
+            JobStatus::Success => "█",
+            JobStatus::Failed => "█",
+            JobStatus::AllowedFailure => "▒",
+        };
+
+        let bar: String = (0..bar_width)
+            .map(|i| {
+                if i >= start_col && i < end_col {
+                    bar_char
+                } else {
+                    "·"
+                }
+            })
+            .collect();
+
+        let colored_bar = match job.status {
+            JobStatus::Success => format!("{}", style(&bar).green()),
+            JobStatus::Failed => format!("{}", style(&bar).red()),
+            JobStatus::AllowedFailure => format!("{}", style(&bar).yellow()),
+        };
+
+        println!(
+            "  {:width$}  │{colored_bar}│ {}",
+            job.name,
+            style(format_duration(job.duration)).dim(),
+            width = max_name,
+        );
+    }
+
+    // Time axis
+    let axis_label = format!(
+        "  {:width$}  │{:<bar_width$}│",
+        "",
+        format!(
+            "0s{}{}",
+            " ".repeat(bar_width / 2 - 4),
+            format_duration(total)
+        ),
+        width = max_name,
+        bar_width = bar_width,
+    );
+    println!("{}", style(axis_label).dim());
 }
 
 fn format_duration(d: std::time::Duration) -> String {
@@ -365,19 +592,6 @@ pub fn print_preflight_report(plan: &Plan, global_vars: &Variables) -> usize {
             "{} job(s) may fail due to missing variables.",
             style(jobs_with_missing).red().bold()
         );
-        println!("Options:");
-        println!(
-            "  1. Add missing values to {}",
-            style(".lab/secrets.env").cyan()
-        );
-        println!(
-            "  2. Run specific jobs: {}",
-            style("lab run <job-name>").cyan()
-        );
-        println!(
-            "  3. Skip this check: {}",
-            style("lab run --no-preflight").cyan()
-        );
         println!();
     }
 
@@ -449,5 +663,57 @@ pub fn print_analysis_report(findings: &[Finding]) {
             .red()
             .bold()
         );
+    }
+}
+
+/// Print actionable suggestions for common pipeline failures.
+pub fn print_error_suggestions(err: &lab_core::error::LabError) {
+    let suggestions: Vec<(&str, &str)> = match err {
+        lab_core::error::LabError::ContainerFailed { code } => match code {
+            127 => vec![(
+                "command not found",
+                "the image may be missing required tools — check the job's image or before_script",
+            )],
+            126 => vec![(
+                "permission denied",
+                "script may not be executable — check file permissions or use `sh script.sh`",
+            )],
+            137 => vec![(
+                "killed (OOM or timeout)",
+                "container was killed — increase timeout or check memory usage",
+            )],
+            _ => vec![],
+        },
+        lab_core::error::LabError::Docker(e) => {
+            let msg = e.to_string();
+            if msg.contains("No such image") || msg.contains("not found") {
+                vec![(
+                    "image not found",
+                    "try --pull-policy always or check image name",
+                )]
+            } else if msg.contains("permission denied") || msg.contains("connect") {
+                vec![(
+                    "docker access error",
+                    "ensure Docker is running and your user is in the docker group",
+                )]
+            } else {
+                vec![]
+            }
+        }
+        lab_core::error::LabError::Other(msg) => {
+            if msg.contains("glab") {
+                vec![(
+                    "glab error",
+                    "ensure glab is installed and authenticated: glab auth login",
+                )]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    };
+
+    for (issue, fix) in suggestions {
+        println!("  {} {} — {}", style("tip:").cyan().bold(), issue, fix,);
     }
 }

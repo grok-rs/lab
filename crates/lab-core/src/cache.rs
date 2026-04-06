@@ -6,13 +6,10 @@ use crate::error::{LabError, Result};
 use crate::model::job::{CacheConfig, CacheKey, CachePolicy};
 use crate::model::variables::{Variables, expand_variables};
 
-/// Base directory for cache storage.
-const CACHE_DIR: &str = ".lab/cache";
-
 /// Get the cache directory for a specific key.
 fn cache_dir(workdir: &Path, key: &str) -> PathBuf {
     let sanitized = key.replace(['/', '\\', ' '], "_");
-    workdir.join(CACHE_DIR).join(sanitized)
+    crate::paths::cache_base_dir(workdir).join(sanitized)
 }
 
 /// Resolve the cache key from config and variables.
@@ -196,7 +193,7 @@ fn simple_hash(input: &str) -> String {
 
 /// Clean up all cache data.
 pub fn cleanup_cache(workdir: &Path) {
-    let dir = workdir.join(CACHE_DIR);
+    let dir = crate::paths::cache_base_dir(workdir);
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }

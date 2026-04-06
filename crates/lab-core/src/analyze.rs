@@ -63,7 +63,13 @@ pub fn analyze(pipeline: &Pipeline) -> Vec<Finding> {
         check_manual_without_confirmation(name, job, &mut findings);
         check_privileged_container(name, job, &mut findings);
         check_docker_socket_mount(name, job, &mut findings);
+        check_service_image_tags(name, job, &mut findings);
+        check_secrets_in_image(name, job, &mut findings);
     }
+
+    // Cross-job checks
+    check_unused_variables(pipeline, &mut findings);
+    check_excessive_matrix(pipeline, &mut findings);
 
     // Sort by severity (critical first)
     findings.sort_by_key(|f| match f.severity {
@@ -463,5 +469,121 @@ fn check_privileged_container(name: &str, job: &Job, findings: &mut Vec<Finding>
             suggestion: "Remove --privileged. Use --cap-add for specific capabilities if needed"
                 .into(),
         });
+    }
+}
+
+/// Check for unpinned service image tags (`:latest` or no tag).
+fn check_service_image_tags(name: &str, job: &Job, findings: &mut Vec<Finding>) {
+    if let Some(services) = &job.services {
+        for svc in services {
+            let svc_name = svc.image_name();
+            if svc_name.ends_with(":latest") || (!svc_name.contains(':') && !svc_name.contains('@'))
+            {
+                findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: Category::BestPractice,
+                    job: Some(name.into()),
+                    rule: "unpinned-service-tag".into(),
+                    message: format!("Service '{svc_name}' in job '{name}' uses :latest or no tag"),
+                    suggestion:
+                        "Pin service images to specific versions (e.g., postgres:16-alpine)".into(),
+                });
+            }
+        }
+    }
+}
+
+/// Check for variables defined globally but never referenced in any job.
+fn check_unused_variables(pipeline: &Pipeline, findings: &mut Vec<Finding>) {
+    let var_pattern = regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap();
+    let skip_prefixes = ["CI_", "GITLAB_", "DOCKER_", "FF_"];
+
+    // Collect all variable references from all jobs
+    let mut referenced = std::collections::HashSet::new();
+    for job in pipeline.jobs.values() {
+        let mut texts = job.script.clone();
+        if let Some(bs) = &job.before_script {
+            texts.extend(bs.iter().cloned());
+        }
+        if let Some(a_s) = &job.after_script {
+            texts.extend(a_s.iter().cloned());
+        }
+        for (_, v) in &job.variables {
+            texts.push(v.value().to_string());
+        }
+        for text in &texts {
+            for cap in var_pattern.captures_iter(text) {
+                referenced.insert(cap[1].to_string());
+            }
+        }
+    }
+
+    // Check global variables that are never referenced
+    for key in pipeline.variables.keys() {
+        if skip_prefixes.iter().any(|p| key.starts_with(p)) {
+            continue;
+        }
+        if !referenced.contains(key) {
+            findings.push(Finding {
+                severity: Severity::Info,
+                category: Category::BestPractice,
+                job: None,
+                rule: "unused-variable".into(),
+                message: format!("Global variable '{key}' is defined but never referenced"),
+                suggestion: "Remove unused variables to reduce clutter and potential confusion"
+                    .into(),
+            });
+        }
+    }
+}
+
+/// Check for credentials/tokens in image names (e.g., private registry URLs with embedded auth).
+fn check_secrets_in_image(name: &str, job: &Job, findings: &mut Vec<Finding>) {
+    let image_name = job
+        .image
+        .as_ref()
+        .map(|i| i.name().to_string())
+        .unwrap_or_default();
+
+    let suspicious = ["password", "token", "secret", "oauth2:", "x-token"];
+    let lower = image_name.to_lowercase();
+    if suspicious.iter().any(|s| lower.contains(s)) {
+        findings.push(Finding {
+            severity: Severity::Critical,
+            category: Category::Security,
+            job: Some(name.into()),
+            rule: "secret-in-image-name".into(),
+            message: format!("Job '{name}' image name may contain credentials: {image_name}"),
+            suggestion:
+                "Use Docker registry authentication instead of embedding credentials in image URLs"
+                    .into(),
+        });
+    }
+}
+
+/// Check for excessive matrix expansion (>20 combinations).
+fn check_excessive_matrix(pipeline: &Pipeline, findings: &mut Vec<Finding>) {
+    for (name, job) in &pipeline.jobs {
+        if let Some(ref parallel) = job.parallel {
+            use crate::model::job::ParallelConfig;
+            if let ParallelConfig::Matrix { matrix } = parallel {
+                let total: usize = matrix
+                    .iter()
+                    .map(|m| m.values().map(|v| v.as_slice().len()).product::<usize>())
+                    .sum();
+                if total > 20 {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        category: Category::Performance,
+                        job: Some(name.into()),
+                        rule: "excessive-matrix".into(),
+                        message: format!(
+                            "Job '{name}' matrix expands to {total} combinations"
+                        ),
+                        suggestion: "Consider splitting into multiple jobs or reducing matrix dimensions to keep pipeline manageable".into(),
+                    });
+                }
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ pub mod docker;
 pub mod error;
 pub mod model;
 pub mod parser;
+pub mod paths;
 pub mod planner;
 pub mod runner;
 pub mod secrets;
