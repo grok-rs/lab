@@ -428,6 +428,22 @@ async fn main() -> Result<()> {
 
             let mut cmd = std::process::Command::new("docker");
             cmd.args(["run", "--rm", "-it"]);
+            // Run as current user to prevent root-owned files
+            let uid = std::process::Command::new("id")
+                .args(["-u"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or("1000".into());
+            let gid = std::process::Command::new("id")
+                .args(["-g"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or("1000".into());
+            cmd.args(["-u", &format!("{uid}:{gid}")]);
             cmd.args(["-v", &format!("{workdir_str}:/workspace")]);
             cmd.args(["-w", "/workspace"]);
 

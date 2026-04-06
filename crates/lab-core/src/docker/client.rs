@@ -148,11 +148,17 @@ impl DockerClient {
             ..Default::default()
         };
 
+        // Run as current user to prevent root-owned files in bind-mounted workspace.
+        // This is critical — without it, Docker creates root-owned files in .nx/, dist/,
+        // node_modules/ etc. that the host user can't modify or delete.
+        let uid_gid = get_current_uid_gid();
+
         let mut config = ContainerConfig {
             image: Some(image.to_string()),
             env: Some(env_vec),
             working_dir: Some("/workspace".to_string()),
             host_config: Some(host_config),
+            user: Some(uid_gid),
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
             ..Default::default()
         };
@@ -323,4 +329,27 @@ impl DockerClient {
         debug!(id, "container removed");
         Ok(())
     }
+}
+
+/// Get current user's UID:GID without unsafe code.
+fn get_current_uid_gid() -> String {
+    let uid = std::process::Command::new("id")
+        .args(["-u"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "1000".to_string());
+
+    let gid = std::process::Command::new("id")
+        .args(["-g"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "1000".to_string());
+
+    format!("{uid}:{gid}")
 }
