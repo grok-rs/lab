@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
             job,
             stage,
             file,
-            variables,
+            mut variables,
+            event,
+            tag,
             pull_policy,
             privileged,
             no_artifacts,
@@ -39,6 +41,26 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             logging::init(verbose);
+
+            // Handle --tag shorthand: sets event=tag + CI_COMMIT_TAG
+            if let Some(tag_value) = &tag {
+                variables.push(("CI_COMMIT_TAG".into(), tag_value.clone()));
+                variables.push(("CI_PIPELINE_SOURCE".into(), "push".into()));
+            }
+
+            // Handle --event: override CI_PIPELINE_SOURCE and set related vars
+            if let Some(evt) = &event {
+                variables.push(("CI_PIPELINE_SOURCE".into(), evt.clone()));
+                match evt.as_str() {
+                    "schedule" => {
+                        variables.push(("CI_PIPELINE_SCHEDULE".into(), "true".into()));
+                    }
+                    "web" | "api" => {
+                        // Manual/API triggers
+                    }
+                    _ => {}
+                }
+            }
 
             let workdir = std::env::current_dir()?;
             let project_config = lab_core::config::ProjectConfig::load(&workdir);

@@ -30,6 +30,15 @@ pub enum Command {
         #[arg(short = 'v', long = "var", value_parser = parse_key_val)]
         variables: Vec<(String, String)>,
 
+        /// Simulate a pipeline event: push, merge_request_event, tag, web, schedule.
+        /// Sets CI_PIPELINE_SOURCE and related variables automatically.
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Simulate a tag pipeline (shorthand for --event tag --var CI_COMMIT_TAG=<value>).
+        #[arg(long)]
+        tag: Option<String>,
+
         /// Image pull policy.
         #[arg(long, default_value = "if-not-present")]
         pull_policy: PullPolicyArg,

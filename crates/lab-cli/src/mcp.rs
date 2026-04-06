@@ -303,21 +303,38 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
         .get("file")
         .and_then(|f| f.as_str())
         .unwrap_or(".gitlab-ci.yml");
-    let file_path = PathBuf::from(file);
 
+    // Security: validate file path — prevent path traversal
+    // Only allow .yml/.yaml files relative to cwd (no absolute paths, no ..)
+    let file_path = match validate_file_path(file) {
+        Ok(p) => p,
+        Err(e) => return make_error_response(id, &e),
+    };
+
+    // Security: classify tools by risk level
+    // Read-only tools run freely; write/execute tools require extra validation
     let result = match tool_name {
+        // READ-ONLY: safe — only parse YAML and return structured data
         "lab_analyze" => tool_analyze(&file_path),
         "lab_validate" => tool_validate(&file_path),
         "lab_list" => tool_list(&file_path),
         "lab_dry_run" => tool_dry_run(&file_path, &args),
         "lab_secrets_check" => tool_secrets_check(&file_path),
         "lab_graph" => tool_graph(&file_path),
-        "lab_secrets_pull" => tool_secrets_pull(),
-        "lab_secrets_init" => tool_secrets_init(&file_path),
         "lab_explain_job" => tool_explain_job(&file_path, &args),
         "lab_suggest_fix" => tool_suggest_fix(&file_path, &args),
-        "lab_run_job" => tool_run_job(&file_path, &args),
-        "lab_variable_expand" => tool_variable_expand(&file_path, &args),
+
+        // WRITE: modifies .lab/ directory
+        "lab_secrets_pull" => tool_secrets_pull(),
+        "lab_secrets_init" => tool_secrets_init(&file_path),
+
+        // SENSITIVE: expands variables which may contain secrets — redact masked values
+        "lab_variable_expand" => tool_variable_expand_safe(&file_path, &args),
+
+        // DANGEROUS: executes code in Docker containers
+        // Returns a confirmation prompt instead of running directly
+        "lab_run_job" => tool_run_job_guarded(&file_path, &args),
+
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -755,38 +772,65 @@ fn tool_suggest_fix(file: &PathBuf, args: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(&fix).map_err(|e| e.to_string())
 }
 
-fn tool_run_job(file: &PathBuf, args: &Value) -> Result<String, String> {
-    let job_name = args
-        .get("job")
-        .and_then(|j| j.as_str())
-        .ok_or("missing 'job' parameter")?;
+// Old tool_run_job and tool_variable_expand removed — replaced by
+// tool_run_job_guarded and tool_variable_expand_safe below for security.
 
-    // Run via subprocess to capture output
-    let output = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args([
-            "run",
-            job_name,
-            "-f",
-            file.to_str().unwrap_or(".gitlab-ci.yml"),
-            "--no-preflight",
-        ])
-        .output()
-        .map_err(|e| format!("failed to run job: {e}"))?;
+// ============================================================
+// Security: input validation, path traversal prevention,
+// secret redaction, and execution guarding
+// ============================================================
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Validate file path — prevent path traversal attacks.
+/// Only allows .yml/.yaml files under the current working directory.
+fn validate_file_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
 
-    Ok(json!({
-        "job": job_name,
-        "exit_code": output.status.code(),
-        "success": output.status.success(),
-        "stdout": stdout.chars().take(10000).collect::<String>(),
-        "stderr": stderr.chars().take(5000).collect::<String>(),
-    })
-    .to_string())
+    // Block absolute paths (except if they resolve under cwd)
+    if path.is_absolute() {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("invalid path: {e}"))?;
+        if !canonical.starts_with(&cwd) {
+            return Err(format!(
+                "Security: path '{}' is outside working directory",
+                path.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    // Block path traversal
+    let path_str = path.to_string_lossy();
+    if path_str.contains("..") {
+        return Err("Security: path traversal ('..') not allowed".into());
+    }
+
+    // Allow only yaml files
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "yml" && ext != "yaml" {
+        return Err(format!(
+            "Security: only .yml/.yaml files allowed, got '.{ext}'"
+        ));
+    }
+
+    Ok(path)
 }
 
-fn tool_variable_expand(file: &PathBuf, args: &Value) -> Result<String, String> {
+fn make_error_response(id: &Value, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": message}],
+            "isError": true
+        }
+    })
+}
+
+/// Safe variable expansion — redacts values that look like secrets.
+/// Prevents the LLM from exfiltrating secrets via variable expansion.
+fn tool_variable_expand_safe(file: &PathBuf, args: &Value) -> Result<String, String> {
     let expression = args
         .get("expression")
         .and_then(|e| e.as_str())
@@ -805,10 +849,61 @@ fn tool_variable_expand(file: &PathBuf, args: &Value) -> Result<String, String> 
 
     let expanded = lab_core::model::variables::expand_variables(expression, &all_vars);
 
+    // Security: redact the expanded value if it contains any secret values
+    let masker = lab_core::secrets::SecretMasker::from_secrets(&secret_vars);
+    let safe_expanded = if masker.has_values() {
+        masker.mask(&expanded)
+    } else {
+        expanded
+    };
+
     Ok(json!({
         "input": expression,
-        "expanded": expanded,
-        "variables_used": all_vars.len()
+        "expanded": safe_expanded,
+        "note": if safe_expanded.contains("[MASKED]") {
+            "Some values redacted because they contain secrets"
+        } else {
+            ""
+        }
+    })
+    .to_string())
+}
+
+/// Guarded job execution — returns a confirmation request instead of running directly.
+/// The LLM cannot execute jobs without the user seeing what will happen.
+fn tool_run_job_guarded(file: &PathBuf, args: &Value) -> Result<String, String> {
+    let job_name = args
+        .get("job")
+        .and_then(|j| j.as_str())
+        .ok_or("missing 'job' parameter")?;
+
+    // First, show what the job would do (dry-run)
+    let pipeline = parse_pipeline(file).map_err(|e| e.to_string())?;
+    let job = pipeline
+        .jobs
+        .get(job_name)
+        .ok_or_else(|| format!("job '{job_name}' not found"))?;
+
+    let image = job.image.as_ref().map(|i| i.name()).unwrap_or("(default)");
+    let script_preview: Vec<&str> = job.script.iter().map(|s| s.as_str()).take(5).collect();
+    let has_services = job.services.as_ref().is_some_and(|s| !s.is_empty());
+
+    Ok(json!({
+        "status": "confirmation_required",
+        "job": job_name,
+        "image": image,
+        "stage": job.stage,
+        "script_preview": script_preview,
+        "script_count": job.script.len(),
+        "has_services": has_services,
+        "message": format!(
+            "Job '{job_name}' will execute {} command(s) in Docker container '{image}'. \
+             To run it, the user should execute: lab run {job_name} -f {}",
+            job.script.len(),
+            file.display()
+        ),
+        "warning": "This tool does NOT execute the job directly. \
+                    Tell the user to run the command shown above in their terminal."
     })
     .to_string())
 }
