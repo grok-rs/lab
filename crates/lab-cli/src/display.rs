@@ -1,8 +1,97 @@
 use console::style;
 use lab_core::analyze::{Finding, Severity};
+use lab_core::model::job::Job;
 use lab_core::model::pipeline::{Pipeline, Plan};
 use lab_core::model::variables::Variables;
 use lab_core::runner::output::{JobResult, JobStatus, PipelineResult};
+
+/// Print detailed configuration for a specific job.
+pub fn print_job_explain(name: &str, job: &Job) {
+    println!("{}", style(format!("Job: {name}")).bold());
+    println!();
+    println!("  {}  {}", style("Stage:").dim(), job.stage);
+    println!(
+        "  {}  {}",
+        style("Image:").dim(),
+        job.image.as_ref().map(|i| i.name()).unwrap_or("(default)")
+    );
+    println!("  {}   {:?}", style("When:").dim(), job.when);
+    if let Some(timeout) = job.timeout {
+        println!("  {} {}s", style("Timeout:").dim(), timeout.as_secs());
+    }
+    if let Some(retry) = &job.retry {
+        println!("  {}  max {}", style("Retry:").dim(), retry.max_retries());
+    }
+    if let Some(coverage) = &job.coverage {
+        println!("  {} {}", style("Coverage:").dim(), coverage);
+    }
+    if let Some(rg) = &job.resource_group {
+        println!("  {} {}", style("Resource group:").dim(), rg);
+    }
+
+    if let Some(needs) = &job.needs {
+        println!();
+        println!("  {}", style("Dependencies:").dim());
+        for n in needs {
+            let opt = if n.is_optional() { " (optional)" } else { "" };
+            let art = if !n.wants_artifacts() {
+                " (no artifacts)"
+            } else {
+                ""
+            };
+            println!("    {} {}{}{}", style("→").dim(), n.job_name(), opt, art);
+        }
+    }
+
+    if let Some(services) = &job.services {
+        println!();
+        println!("  {}", style("Services:").dim());
+        for svc in services {
+            println!("    {} {}", style("●").cyan(), svc.image_name());
+        }
+    }
+
+    if !job.variables.is_empty() {
+        println!();
+        println!("  {}", style("Variables:").dim());
+        for (k, v) in &job.variables {
+            println!("    {}={}", style(k).green(), v.value());
+        }
+    }
+
+    if let Some(rules) = &job.rules {
+        println!();
+        println!("  {}", style("Rules:").dim());
+        for rule in rules {
+            if let Some(expr) = &rule.if_expr {
+                let when = rule.when.map(|w| format!(" → {w:?}")).unwrap_or_default();
+                println!("    {} if: {}{}", style("·").dim(), expr, style(when).dim());
+            }
+            if rule.changes.is_some() {
+                println!("    {} changes: [...]", style("·").dim());
+            }
+            if rule.exists.is_some() {
+                println!("    {} exists: [...]", style("·").dim());
+            }
+        }
+    }
+
+    println!();
+    println!("  {}", style("Script:").dim());
+    if let Some(before) = &job.before_script {
+        for cmd in before {
+            println!("    {} {}", style("(before)").dim(), cmd);
+        }
+    }
+    for cmd in &job.script {
+        println!("    {}", cmd);
+    }
+    if let Some(after) = &job.after_script {
+        for cmd in after {
+            println!("    {} {}", style("(after)").dim(), cmd);
+        }
+    }
+}
 
 /// Print pipeline jobs grouped by stage.
 pub fn print_pipeline_list(pipeline: &Pipeline) {
@@ -399,7 +488,7 @@ pub fn print_dry_run(
     secret_vars: &Variables,
 ) {
     let total_jobs: usize = plan.stages.iter().map(|s| s.jobs.len()).sum();
-    let var_re = regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap();
+    let var_re = &*lab_core::model::variables::VAR_REFERENCE_PATTERN;
 
     println!("{}", style("Dry Run — Execution Plan").bold().underlined());
     println!();
@@ -511,7 +600,7 @@ pub fn print_dry_run(
 /// Pre-flight check: report which jobs have missing variables.
 /// Returns the number of jobs with missing variables.
 pub fn print_preflight_report(plan: &Plan, global_vars: &Variables) -> usize {
-    let var_re = regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap();
+    let var_re = &*lab_core::model::variables::VAR_REFERENCE_PATTERN;
     let skip_prefixes = [
         "CI_", "GITLAB_", "DOCKER_", "HOME", "PATH", "USER", "SHELL", "PWD", "TERM",
     ];

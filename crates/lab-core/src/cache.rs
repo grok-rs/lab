@@ -41,7 +41,7 @@ pub fn resolve_cache_key(config: &CacheConfig, variables: &Variables) -> String 
                     }
                 }
             }
-            let hash = simple_hash(&hasher_input);
+            let hash = format!("{:016x}", crate::paths::simple_hash(&hasher_input));
             match prefix {
                 Some(p) => format!("{}-{hash}", expand_variables(p, variables)),
                 None => hash,
@@ -161,7 +161,9 @@ pub fn save_cache(
     Ok(())
 }
 
-fn copy_cache_to_container(container_id: &str, source_dir: &Path, _paths: &[String]) -> Result<()> {
+// TODO: filter copied files by configured cache paths
+#[allow(unused_variables)]
+fn copy_cache_to_container(container_id: &str, source_dir: &Path, paths: &[String]) -> Result<()> {
     for entry in std::fs::read_dir(source_dir).map_err(|e| LabError::FileRead {
         path: source_dir.to_path_buf(),
         source: e,
@@ -180,15 +182,6 @@ fn copy_cache_to_container(container_id: &str, source_dir: &Path, _paths: &[Stri
         }
     }
     Ok(())
-}
-
-/// Simple string hash for cache keys.
-fn simple_hash(input: &str) -> String {
-    let mut hash: u64 = 5381;
-    for byte in input.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    format!("{hash:016x}")
 }
 
 /// Clean up all cache data.

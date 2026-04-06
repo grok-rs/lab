@@ -83,75 +83,11 @@ async fn main() -> Result<()> {
             logging::init(verbose);
             check_tools()?;
 
-            // Handle --tag shorthand: simulates a tag push pipeline
             if let Some(tag_value) = &tag {
-                variables.push(("CI_COMMIT_TAG".into(), tag_value.clone()));
-                variables.push(("CI_PIPELINE_SOURCE".into(), "push".into()));
-                // Extract ref name from tag
-                let ref_name = tag_value
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(tag_value)
-                    .to_string();
-                variables.push(("CI_COMMIT_REF_NAME".into(), ref_name));
+                lab_core::model::variables::apply_tag_simulation(tag_value, &mut variables);
             }
-
-            // Handle --event: set CI_PIPELINE_SOURCE and related vars per event type.
-            // All possible values from GitLab docs:
-            // https://docs.gitlab.com/ci/jobs/job_rules/#ci_pipeline_source-predefined-variable
             if let Some(evt) = &event {
-                variables.push(("CI_PIPELINE_SOURCE".into(), evt.clone()));
-                match evt.as_str() {
-                    "push" => {
-                        // Default for branch pushes — auto-detected already
-                    }
-                    "merge_request_event" => {
-                        // MR pipeline — needs MR-specific vars
-                        variables.push(("CI_MERGE_REQUEST_IID".into(), "0".into()));
-                    }
-                    "schedule" => {
-                        variables.push(("CI_PIPELINE_SCHEDULE".into(), "true".into()));
-                    }
-                    "web" => {
-                        // Manual trigger via GitLab UI "Run pipeline"
-                    }
-                    "api" => {
-                        // Triggered via /api/v4/projects/:id/pipeline
-                    }
-                    "trigger" => {
-                        // Triggered via trigger token
-                        variables.push(("CI_PIPELINE_TRIGGERED".into(), "true".into()));
-                    }
-                    "pipeline" => {
-                        // Multi-project pipeline (downstream)
-                    }
-                    "parent_pipeline" => {
-                        // Child pipeline triggered by parent
-                    }
-                    "chat" => {
-                        // GitLab ChatOps command
-                    }
-                    "webide" => {
-                        // Web IDE pipeline
-                    }
-                    "external_pull_request_event" => {
-                        // GitHub external PR
-                    }
-                    "ondemand_dast_scan" | "ondemand_dast_validation" => {
-                        // DAST scan pipelines
-                    }
-                    "security_orchestration_policy" => {
-                        // Scheduled scan execution policy
-                    }
-                    other => {
-                        eprintln!(
-                            "Warning: unknown event '{}'. Valid events: push, merge_request_event, \
-                             schedule, web, api, trigger, pipeline, parent_pipeline, chat, webide, \
-                             external_pull_request_event",
-                            other
-                        );
-                    }
-                }
+                lab_core::model::variables::apply_pipeline_event(evt, &mut variables);
             }
 
             let workdir = std::env::current_dir()?;
@@ -326,7 +262,7 @@ async fn main() -> Result<()> {
             }
 
             // Pre-flight variable check
-            if !no_preflight && !dry_run {
+            if !no_preflight {
                 let missing_count = display::print_preflight_report(&plan, &global_vars);
 
                 if missing_count > 0 {
@@ -514,31 +450,8 @@ async fn main() -> Result<()> {
                 let mut total_size: u64 = 0;
                 let mut file_count: usize = 0;
 
-                fn walk_dir(
-                    dir: &std::path::Path,
-                    base: &std::path::Path,
-                    total_size: &mut u64,
-                    file_count: &mut usize,
-                    files: &mut Vec<(String, u64)>,
-                ) {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                walk_dir(&path, base, total_size, file_count, files);
-                            } else if let Ok(meta) = path.metadata() {
-                                let rel = path.strip_prefix(base).unwrap_or(&path);
-                                let size = meta.len();
-                                *total_size += size;
-                                *file_count += 1;
-                                files.push((rel.display().to_string(), size));
-                            }
-                        }
-                    }
-                }
-
                 let mut files = Vec::new();
-                walk_dir(
+                walk_dir_recursive(
                     &job_dir,
                     &job_dir,
                     &mut total_size,
@@ -646,91 +559,7 @@ async fn main() -> Result<()> {
                 .jobs
                 .get(&job)
                 .ok_or_else(|| anyhow::anyhow!("job '{job}' not found"))?;
-
-            println!("{}", style(format!("Job: {job}")).bold());
-            println!();
-            println!("  {}  {}", style("Stage:").dim(), j.stage);
-            println!(
-                "  {}  {}",
-                style("Image:").dim(),
-                j.image.as_ref().map(|i| i.name()).unwrap_or("(default)")
-            );
-            println!("  {}   {:?}", style("When:").dim(), j.when);
-            if let Some(timeout) = j.timeout {
-                println!("  {} {}s", style("Timeout:").dim(), timeout.as_secs());
-            }
-            if let Some(retry) = &j.retry {
-                println!("  {}  max {}", style("Retry:").dim(), retry.max_retries());
-            }
-            if let Some(coverage) = &j.coverage {
-                println!("  {} {}", style("Coverage:").dim(), coverage);
-            }
-            if let Some(rg) = &j.resource_group {
-                println!("  {} {}", style("Resource group:").dim(), rg);
-            }
-
-            if let Some(needs) = &j.needs {
-                println!();
-                println!("  {}", style("Dependencies:").dim());
-                for n in needs {
-                    let opt = if n.is_optional() { " (optional)" } else { "" };
-                    let art = if !n.wants_artifacts() {
-                        " (no artifacts)"
-                    } else {
-                        ""
-                    };
-                    println!("    {} {}{}{}", style("→").dim(), n.job_name(), opt, art);
-                }
-            }
-
-            if let Some(services) = &j.services {
-                println!();
-                println!("  {}", style("Services:").dim());
-                for svc in services {
-                    println!("    {} {}", style("●").cyan(), svc.image_name());
-                }
-            }
-
-            if !j.variables.is_empty() {
-                println!();
-                println!("  {}", style("Variables:").dim());
-                for (k, v) in &j.variables {
-                    println!("    {}={}", style(k).green(), v.value());
-                }
-            }
-
-            if let Some(rules) = &j.rules {
-                println!();
-                println!("  {}", style("Rules:").dim());
-                for rule in rules {
-                    if let Some(expr) = &rule.if_expr {
-                        let when = rule.when.map(|w| format!(" → {w:?}")).unwrap_or_default();
-                        println!("    {} if: {}{}", style("·").dim(), expr, style(when).dim());
-                    }
-                    if rule.changes.is_some() {
-                        println!("    {} changes: [...]", style("·").dim());
-                    }
-                    if rule.exists.is_some() {
-                        println!("    {} exists: [...]", style("·").dim());
-                    }
-                }
-            }
-
-            println!();
-            println!("  {}", style("Script:").dim());
-            if let Some(before) = &j.before_script {
-                for cmd in before {
-                    println!("    {} {}", style("(before)").dim(), cmd);
-                }
-            }
-            for cmd in &j.script {
-                println!("    {}", cmd);
-            }
-            if let Some(after) = &j.after_script {
-                for cmd in after {
-                    println!("    {} {}", style("(after)").dim(), cmd);
-                }
-            }
+            display::print_job_explain(&job, j);
         }
 
         Command::Watch {
@@ -963,7 +792,7 @@ async fn main() -> Result<()> {
             let workdir = std::env::current_dir()?;
 
             match action {
-                SecretsAction::Pull { group: _ } => {
+                SecretsAction::Pull => {
                     println!("Pulling variables from GitLab...");
                     let result =
                         secrets::pull_secrets_full(&workdir).context("failed to pull secrets")?;
@@ -1289,6 +1118,29 @@ fn parse_memory_string(s: &str) -> anyhow::Result<i64> {
         Ok(num.parse::<f64>()? as i64 * 1024)
     } else {
         Ok(s.parse::<i64>()?)
+    }
+}
+
+fn walk_dir_recursive(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    total_size: &mut u64,
+    file_count: &mut usize,
+    files: &mut Vec<(String, u64)>,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_dir_recursive(&path, base, total_size, file_count, files);
+            } else if let Ok(meta) = path.metadata() {
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                let size = meta.len();
+                *total_size += size;
+                *file_count += 1;
+                files.push((rel.display().to_string(), size));
+            }
+        }
     }
 }
 

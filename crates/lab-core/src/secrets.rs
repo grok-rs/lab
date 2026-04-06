@@ -426,8 +426,10 @@ pub fn check_secrets(pipeline: &Pipeline, available: &Variables) -> Vec<MissingS
             .jobs
             .iter()
             .filter(|(_, job)| {
-                let job_yaml = format!("{:?}", job);
-                job_yaml.contains(var_name)
+                let texts = collect_job_texts(job);
+                let combined = texts.join(" ");
+                combined.contains(&format!("${var_name}"))
+                    || combined.contains(&format!("${{{var_name}}}"))
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -498,7 +500,7 @@ fn fetch_glab_variables_raw(args: &[&str]) -> Result<Vec<GitLabVarMeta>> {
 /// Scan pipeline for `$VARIABLE` references in scripts and variable values.
 fn find_referenced_variables(pipeline: &Pipeline) -> Vec<String> {
     let mut refs = HashSet::new();
-    let var_pattern = regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap();
+    let var_pattern = &*crate::model::variables::VAR_REFERENCE_PATTERN;
 
     // Scan all jobs
     for job in pipeline.jobs.values() {

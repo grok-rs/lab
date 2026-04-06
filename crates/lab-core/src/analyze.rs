@@ -495,7 +495,7 @@ fn check_service_image_tags(name: &str, job: &Job, findings: &mut Vec<Finding>) 
 
 /// Check for variables defined globally but never referenced in any job.
 fn check_unused_variables(pipeline: &Pipeline, findings: &mut Vec<Finding>) {
-    let var_pattern = regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap();
+    let var_pattern = &*crate::model::variables::VAR_REFERENCE_PATTERN;
     let skip_prefixes = ["CI_", "GITLAB_", "DOCKER_", "FF_"];
 
     // Collect all variable references from all jobs

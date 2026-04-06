@@ -4,6 +4,10 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::error::Result;
 
+/// Shared regex for matching `$VAR` and `${VAR}` references in text.
+pub static VAR_REFERENCE_PATTERN: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").unwrap());
+
 /// CI/CD variables map — ordered to preserve declaration order.
 /// Ref: <https://docs.gitlab.com/ci/variables/>
 pub type Variables = IndexMap<String, VariableValue>;
@@ -204,6 +208,49 @@ pub fn to_env_map(vars: &Variables) -> IndexMap<String, String> {
     vars.iter()
         .map(|(k, v)| (k.clone(), expand_variables(v.value(), vars)))
         .collect()
+}
+
+/// Apply pipeline event type to variables (sets CI_PIPELINE_SOURCE and related vars).
+/// Ref: <https://docs.gitlab.com/ci/jobs/job_rules/#ci_pipeline_source-predefined-variable>
+pub fn apply_pipeline_event(event: &str, variables: &mut Vec<(String, String)>) {
+    variables.push(("CI_PIPELINE_SOURCE".into(), event.to_string()));
+    match event {
+        "push" => {}
+        "merge_request_event" => {
+            variables.push(("CI_MERGE_REQUEST_IID".into(), "0".into()));
+        }
+        "schedule" => {
+            variables.push(("CI_PIPELINE_SCHEDULE".into(), "true".into()));
+        }
+        "trigger" => {
+            variables.push(("CI_PIPELINE_TRIGGERED".into(), "true".into()));
+        }
+        "web"
+        | "api"
+        | "pipeline"
+        | "parent_pipeline"
+        | "chat"
+        | "webide"
+        | "external_pull_request_event"
+        | "ondemand_dast_scan"
+        | "ondemand_dast_validation"
+        | "security_orchestration_policy" => {}
+        other => {
+            eprintln!(
+                "Warning: unknown event '{other}'. Valid events: push, merge_request_event, \
+                 schedule, web, api, trigger, pipeline, parent_pipeline, chat, webide, \
+                 external_pull_request_event"
+            );
+        }
+    }
+}
+
+/// Apply tag simulation to variables.
+pub fn apply_tag_simulation(tag: &str, variables: &mut Vec<(String, String)>) {
+    variables.push(("CI_COMMIT_TAG".into(), tag.to_string()));
+    variables.push(("CI_PIPELINE_SOURCE".into(), "push".into()));
+    let ref_name = tag.rsplit('/').next().unwrap_or(tag).to_string();
+    variables.push(("CI_COMMIT_REF_NAME".into(), ref_name));
 }
 
 /// Build predefined CI/CD variables for local execution.

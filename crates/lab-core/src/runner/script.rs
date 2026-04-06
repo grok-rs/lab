@@ -340,8 +340,8 @@ async fn run_with_retry_and_timeout(
 
         match result {
             Ok(stdout) => return Ok(stdout),
-            Err(ref e) => {
-                let failure_type = match e {
+            Err(e) => {
+                let failure_type = match &e {
                     LabError::ContainerFailed { .. } => "script_failure",
                     LabError::Other(msg) if msg.contains("timed out") => "stuck_or_timeout_failure",
                     _ => "unknown_failure",
@@ -351,11 +351,10 @@ async fn run_with_retry_and_timeout(
                     .map(|r| r.should_retry(failure_type))
                     .unwrap_or(true);
 
+                last_err = Some(e);
                 if !should_retry || attempt == max_retries {
-                    last_err = Some(result.unwrap_err());
                     break;
                 }
-                last_err = Some(result.unwrap_err());
             }
         }
     }

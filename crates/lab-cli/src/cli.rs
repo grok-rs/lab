@@ -251,11 +251,7 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum SecretsAction {
     /// Pull secrets from GitLab project and group variables (via glab).
-    Pull {
-        /// Fetch from a specific group instead of auto-detecting.
-        #[arg(short, long)]
-        group: Option<String>,
-    },
+    Pull,
 
     /// Check which secrets are available vs missing.
     Check,

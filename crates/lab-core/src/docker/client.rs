@@ -1,12 +1,9 @@
-#![allow(deprecated)]
-
 use bollard::Docker;
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, RemoveContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
-use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
 use futures::StreamExt;
 use indexmap::IndexMap;
 use tracing::{debug, info};
@@ -64,7 +61,7 @@ impl DockerClient {
         spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
         let options = CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         };
 
@@ -83,47 +80,6 @@ impl DockerClient {
         spinner.finish_and_clear();
         info!(image, "pulled image");
         Ok(())
-    }
-
-    /// Create a container and return its ID.
-    pub async fn create_container(
-        &self,
-        image: &str,
-        env: &IndexMap<String, String>,
-        workdir: &str,
-    ) -> Result<String> {
-        self.create_job_container(&CreateJobOpts {
-            image,
-            env,
-            workdir,
-            network: None,
-            entrypoint: None,
-            secrets_file: None,
-            cpus: None,
-            memory: None,
-        })
-        .await
-    }
-
-    /// Create a container on a specific network.
-    pub async fn create_container_with_network(
-        &self,
-        image: &str,
-        env: &IndexMap<String, String>,
-        workdir: &str,
-        network: Option<&str>,
-    ) -> Result<String> {
-        self.create_job_container(&CreateJobOpts {
-            image,
-            env,
-            workdir,
-            network,
-            entrypoint: None,
-            secrets_file: None,
-            cpus: None,
-            memory: None,
-        })
-        .await
     }
 
     /// Create a job container with all options.
@@ -153,7 +109,7 @@ impl DockerClient {
             ..Default::default()
         };
 
-        let mut config = ContainerConfig {
+        let mut body = ContainerCreateBody {
             image: Some(opts.image.to_string()),
             env: Some(env_vec),
             working_dir: Some("/workspace".to_string()),
@@ -163,12 +119,12 @@ impl DockerClient {
         };
 
         if let Some(ep) = opts.entrypoint {
-            config.entrypoint = Some(ep.to_vec());
+            body.entrypoint = Some(ep.to_vec());
         }
 
         let response = self
             .docker
-            .create_container(Some(CreateContainerOptions::<String>::default()), config)
+            .create_container(Some(CreateContainerOptions::default()), body)
             .await
             .map_err(LabError::Docker)?;
 
@@ -179,7 +135,7 @@ impl DockerClient {
     /// Start a container.
     pub async fn start_container(&self, id: &str) -> Result<()> {
         self.docker
-            .start_container(id, None::<StartContainerOptions<String>>)
+            .start_container(id, None::<StartContainerOptions>)
             .await
             .map_err(LabError::Docker)?;
         debug!(id, "container started");
@@ -195,18 +151,7 @@ impl DockerClient {
         cmd: &[String],
         env: &IndexMap<String, String>,
     ) -> Result<RunResult> {
-        self.run_in_container_masked(id, cmd, env, None).await
-    }
-
-    /// Run a command with secret masking and optional job-name prefix on output.
-    pub async fn run_in_container_masked(
-        &self,
-        id: &str,
-        cmd: &[String],
-        env: &IndexMap<String, String>,
-        masker: Option<&crate::secrets::SecretMasker>,
-    ) -> Result<RunResult> {
-        self.run_in_container_full(id, cmd, env, masker, None).await
+        self.run_in_container_full(id, cmd, env, None, None).await
     }
 
     /// Run a command with all output options.
@@ -311,7 +256,13 @@ impl DockerClient {
     /// Stop a container.
     pub async fn stop_container(&self, id: &str) -> Result<()> {
         self.docker
-            .stop_container(id, Some(StopContainerOptions { t: 5 }))
+            .stop_container(
+                id,
+                Some(StopContainerOptions {
+                    t: Some(5),
+                    signal: None,
+                }),
+            )
             .await
             .map_err(LabError::Docker)?;
         debug!(id, "container stopped");
@@ -358,25 +309,13 @@ fn host_docker_socket_available() -> bool {
 
 /// Get current user's UID:GID without unsafe code.
 pub fn get_current_uid_gid() -> String {
-    let uid = std::process::Command::new("id")
-        .args(["-u"])
+    std::process::Command::new("sh")
+        .args(["-c", "echo $(id -u):$(id -g)"])
         .output()
         .ok()
-        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "1000".to_string());
-
-    let gid = std::process::Command::new("id")
-        .args(["-g"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "1000".to_string());
-
-    format!("{uid}:{gid}")
+        .unwrap_or_else(|| "1000:1000".to_string())
 }
 
 #[cfg(test)]

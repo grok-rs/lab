@@ -14,6 +14,15 @@ use super::job_context::JobContext;
 use super::output::{JobStatus, PipelineResult};
 use super::script;
 
+/// RAII guard that removes a lock file when dropped.
+struct LockGuard(std::path::PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.as_path());
+    }
+}
+
 /// The main runner that converts a Plan into an async pipeline.
 pub struct Runner {
     config: Arc<Config>,
@@ -115,12 +124,10 @@ impl Runner {
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                Some(lock_path)
+                Some(LockGuard(lock_path))
             } else {
                 None
             };
-
-            // Ensure lock is released when job completes (via Drop-like cleanup at end)
 
             // Handle manual jobs — GitLab pauses and waits for user approval.
             // Ref: <https://docs.gitlab.com/ci/yaml/#when>
@@ -295,11 +302,7 @@ impl Runner {
                 }
             }
 
-            // Release resource_group lock
-            if let Some(lock_path) = _resource_lock {
-                let _ = std::fs::remove_file(&lock_path);
-            }
-
+            drop(_resource_lock);
             result.map(|_| ())
         })
     }

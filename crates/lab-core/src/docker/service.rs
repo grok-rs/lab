@@ -1,14 +1,10 @@
-#![allow(deprecated)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
-    StartContainerOptions,
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, RemoveContainerOptions, StartContainerOptions,
 };
-use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
@@ -97,7 +93,7 @@ impl ServiceOrchestrator {
 
         // Pull image
         let pull_options = CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         };
         let mut stream = self
@@ -132,7 +128,7 @@ impl ServiceOrchestrator {
             ..Default::default()
         };
 
-        let mut config = ContainerConfig {
+        let mut body = ContainerCreateBody {
             image: Some(image.to_string()),
             env: Some(env_vec),
             host_config: Some(host_config),
@@ -141,17 +137,16 @@ impl ServiceOrchestrator {
         };
 
         if let Some(ep) = entrypoint {
-            config.entrypoint = Some(ep);
+            body.entrypoint = Some(ep);
         }
         if let Some(c) = cmd {
-            config.cmd = Some(c);
+            body.cmd = Some(c);
         }
 
-        let create_opts = CreateContainerOptions::<String>::default();
         let response = self
             .docker
             .inner()
-            .create_container(Some(create_opts), config)
+            .create_container(Some(CreateContainerOptions::default()), body)
             .await
             .map_err(LabError::Docker)?;
 
@@ -160,7 +155,7 @@ impl ServiceOrchestrator {
         // Start
         self.docker
             .inner()
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await
             .map_err(LabError::Docker)?;
 
@@ -207,7 +202,10 @@ impl ServiceOrchestrator {
             match self
                 .docker
                 .inner()
-                .inspect_container(&rs.id, None::<bollard::container::InspectContainerOptions>)
+                .inspect_container(
+                    &rs.id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
                 .await
             {
                 Ok(info) => {

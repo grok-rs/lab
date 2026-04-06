@@ -1,23 +1,19 @@
-#![allow(deprecated)]
-
+use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkCreateRequest};
 use bollard::Docker;
-use bollard::models::EndpointSettings;
-use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
 use tracing::debug;
 
 use crate::error::{LabError, Result};
 
 /// Create a Docker network for job + service communication.
-/// Ref: <https://docs.gitlab.com/ci/services/#accessing-the-services>
 pub async fn create_network(docker: &Docker, name: &str) -> Result<String> {
-    let options = CreateNetworkOptions {
+    let request = NetworkCreateRequest {
         name: name.to_string(),
-        driver: "bridge".to_string(),
+        driver: Some("bridge".to_string()),
         ..Default::default()
     };
 
     let response = docker
-        .create_network(options)
+        .create_network(request)
         .await
         .map_err(LabError::Docker)?;
 
@@ -33,16 +29,16 @@ pub async fn connect_to_network(
     container_id: &str,
     aliases: &[String],
 ) -> Result<()> {
-    let config = ConnectNetworkOptions {
-        container: container_id.to_string(),
-        endpoint_config: EndpointSettings {
+    let request = NetworkConnectRequest {
+        container: Some(container_id.to_string()),
+        endpoint_config: Some(EndpointSettings {
             aliases: Some(aliases.to_vec()),
             ..Default::default()
-        },
+        }),
     };
 
     docker
-        .connect_network(network_id, config)
+        .connect_network(network_id, request)
         .await
         .map_err(LabError::Docker)?;
 

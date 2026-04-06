@@ -80,7 +80,7 @@ pub fn tmp_dir(workdir: &Path) -> PathBuf {
     data_dir().join("tmp").join(workdir_key(workdir))
 }
 
-fn simple_hash(input: &str) -> u64 {
+pub(crate) fn simple_hash(input: &str) -> u64 {
     let mut hash: u64 = 5381;
     for byte in input.bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
