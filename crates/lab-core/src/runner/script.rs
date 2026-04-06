@@ -376,6 +376,8 @@ async fn run_commands(ctx: &JobContext, container_id: &str, commands: &[String])
 /// Sources /run/secrets/env if it exists (secrets mounted as file).
 fn generate_shell_script(commands: &[String]) -> String {
     let mut script = String::new();
+    // Fix "dubious ownership" for bind-mounted workspace
+    script.push_str("git config --global --add safe.directory /workspace 2>/dev/null || true\n");
     // Source secrets file if mounted (secure alternative to env vars)
     script.push_str("[ -f /run/secrets/env ] && . /run/secrets/env\n");
     for cmd in commands {
