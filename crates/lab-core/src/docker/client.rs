@@ -121,6 +121,19 @@ impl DockerClient {
                 env_vec.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
             }
         }
+        // Mount host Docker socket for DinD jobs.
+        // Locally, DinD service is replaced with host Docker — faster and no TLS complexity.
+        if std::path::Path::new("/var/run/docker.sock").exists() {
+            binds.push("/var/run/docker.sock:/var/run/docker.sock".to_string());
+            // Override DinD-related env vars to use host socket instead of TLS
+            env_vec.retain(|e| {
+                !e.starts_with("DOCKER_HOST=")
+                    && !e.starts_with("DOCKER_TLS_VERIFY=")
+                    && !e.starts_with("DOCKER_CERT_PATH=")
+            });
+            env_vec.push("DOCKER_HOST=unix:///var/run/docker.sock".to_string());
+            env_vec.push("DOCKER_TLS_VERIFY=".to_string());
+        }
 
         // Docker Security Hardening (per OWASP Docker Security Cheat Sheet):
         //
