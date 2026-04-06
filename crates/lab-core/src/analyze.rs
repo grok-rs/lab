@@ -61,6 +61,8 @@ pub fn analyze(pipeline: &Pipeline) -> Vec<Finding> {
         check_dind_security(name, job, &mut findings);
         check_duplicate_scripts(name, job, pipeline, &mut findings);
         check_manual_without_confirmation(name, job, &mut findings);
+        check_privileged_container(name, job, &mut findings);
+        check_docker_socket_mount(name, job, &mut findings);
     }
 
     // Sort by severity (critical first)
@@ -423,6 +425,42 @@ fn check_manual_without_confirmation(name: &str, job: &Job, findings: &mut Vec<F
             rule: "manual-deploy-no-confirmation".into(),
             message: format!("Manual deploy job '{name}' has no confirmation message"),
             suggestion: "Add manual_confirmation: 'Are you sure you want to deploy to production?'"
+                .into(),
+        });
+    }
+}
+
+/// OWASP Docker Rule #1: Check for Docker socket mounting in scripts.
+fn check_docker_socket_mount(name: &str, job: &Job, findings: &mut Vec<Finding>) {
+    let script_text = job.script.join(" ").to_lowercase();
+    if script_text.contains("/var/run/docker.sock") || script_text.contains("docker.sock") {
+        findings.push(Finding {
+            severity: Severity::Critical,
+            category: Category::Security,
+            job: Some(name.into()),
+            rule: "docker-socket-mount".into(),
+            message: format!(
+                "Job '{name}' references docker.sock — equivalent to root access on the host"
+            ),
+            suggestion: "Use Docker-in-Docker (dind) service instead of mounting the Docker socket"
+                .into(),
+        });
+    }
+}
+
+/// Check for privileged container usage in variables (DOCKER_HOST without TLS already covered).
+fn check_privileged_container(name: &str, job: &Job, findings: &mut Vec<Finding>) {
+    let script_text = job.script.join(" ");
+    if script_text.contains("--privileged") {
+        findings.push(Finding {
+            severity: Severity::Critical,
+            category: Category::Security,
+            job: Some(name.into()),
+            rule: "privileged-container".into(),
+            message: format!(
+                "Job '{name}' uses --privileged flag — gives full host kernel capabilities"
+            ),
+            suggestion: "Remove --privileged. Use --cap-add for specific capabilities if needed"
                 .into(),
         });
     }

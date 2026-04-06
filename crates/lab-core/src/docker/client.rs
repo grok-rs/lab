@@ -115,9 +115,29 @@ impl DockerClient {
             binds.push(format!("{sf}:/run/secrets/env:ro"));
         }
 
+        // Docker Security Hardening (per OWASP Docker Security Cheat Sheet):
+        //
+        // RULE #3: Drop all capabilities, add back only what's needed
+        // RULE #4: Prevent in-container privilege escalation
+        // RULE #7: Limit resources to prevent DoS
+        // RULE #8: tmpfs for /tmp instead of writable layer
         let host_config = HostConfig {
             binds: Some(binds),
             network_mode: network.map(String::from),
+            // RULE #3: Drop all Linux capabilities
+            cap_drop: Some(vec!["ALL".to_string()]),
+            // RULE #4: Prevent privilege escalation via setuid/setgid
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            // RULE #7: Resource limits (prevent runaway containers)
+            memory: Some(2 * 1024 * 1024 * 1024), // 2GB max memory
+            nano_cpus: Some(4_000_000_000),       // 4 CPU cores max
+            pids_limit: Some(512),                // Max 512 processes
+            // RULE #8: tmpfs for temp files
+            tmpfs: Some(
+                [("/tmp".to_string(), "rw,noexec,nosuid,size=256m".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
             ..Default::default()
         };
 
