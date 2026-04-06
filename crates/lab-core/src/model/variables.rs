@@ -116,6 +116,11 @@ fn expand_recursive(input: &str, vars: &Variables, depth: u32) -> String {
             } else if let Some(val) = lookup_var(&var_name, vars) {
                 let expanded = expand_recursive(val, vars, depth + 1);
                 result.push_str(&expanded);
+            } else {
+                // Leave unresolved ${VAR} as-is for the shell to handle
+                result.push_str("${");
+                result.push_str(&var_name);
+                result.push('}');
             }
             continue;
         }
@@ -152,8 +157,12 @@ fn lookup_var<'a>(name: &str, vars: &'a Variables) -> Option<&'a str> {
 
 /// Build the flat string map from Variables for passing to containers.
 pub fn to_env_map(vars: &Variables) -> IndexMap<String, String> {
+    // GitLab Runner expands variable references in values before injecting them
+    // as environment variables. We must do the same — bash does NOT recursively
+    // expand env var values, so `ECR_REGISTRY=${AWS_ACCOUNT_ID_ECR}.dkr.ecr...`
+    // must be expanded to the literal value before passing to the container.
     vars.iter()
-        .map(|(k, v)| (k.clone(), v.value().to_string()))
+        .map(|(k, v)| (k.clone(), expand_variables(v.value(), vars)))
         .collect()
 }
 
@@ -532,7 +541,32 @@ mod tests {
     #[test]
     fn test_unresolved_passthrough() {
         let v = vars(&[]);
+        // $VAR syntax — unresolved stays as $VAR
         assert_eq!(expand_variables("$UNKNOWN", &v), "$UNKNOWN");
+        // ${VAR} syntax — unresolved stays as ${VAR}
+        assert_eq!(expand_variables("${UNKNOWN}", &v), "${UNKNOWN}");
+    }
+
+    #[test]
+    fn test_shell_local_vars_passthrough() {
+        // Shell-local variables (set within the script) must pass through
+        // because lab doesn't know about them — only the shell does.
+        let v = vars(&[("CI_COMMIT_SHORT_SHA", "abc123")]);
+        // IMAGE_TAG is set in the script, not in lab's variable map
+        assert_eq!(
+            expand_variables("develop_${CI_COMMIT_SHORT_SHA}", &v),
+            "develop_abc123"
+        );
+        assert_eq!(expand_variables("${IMAGE_TAG}", &v), "${IMAGE_TAG}");
+        assert_eq!(
+            expand_variables(".gitlab/scripts/docker-build.sh {} ${IMAGE_TAG}", &v),
+            ".gitlab/scripts/docker-build.sh {} ${IMAGE_TAG}"
+        );
+        // Mixed: known var + unknown shell var in same string
+        assert_eq!(
+            expand_variables("tag: ${IMAGE_TAG} sha: ${CI_COMMIT_SHORT_SHA}", &v),
+            "tag: ${IMAGE_TAG} sha: abc123"
+        );
     }
 
     #[test]
@@ -652,5 +686,40 @@ mod tests {
                 vars.len()
             );
         }
+    }
+
+    #[test]
+    fn test_to_env_map_expands_variable_references() {
+        // GitLab Runner expands refs in variable values before injecting as env.
+        // ECR_REGISTRY: "${AWS_ACCOUNT_ID_ECR}.dkr.ecr.${AWS_REGION_ECR}.amazonaws.com"
+        let v = vars(&[
+            ("AWS_ACCOUNT_ID_ECR", "341304826755"),
+            ("AWS_REGION_ECR", "eu-central-1"),
+            (
+                "ECR_REGISTRY",
+                "${AWS_ACCOUNT_ID_ECR}.dkr.ecr.${AWS_REGION_ECR}.amazonaws.com",
+            ),
+        ]);
+        let env = to_env_map(&v);
+        assert_eq!(
+            env.get("ECR_REGISTRY").unwrap(),
+            "341304826755.dkr.ecr.eu-central-1.amazonaws.com"
+        );
+        // Plain values unchanged
+        assert_eq!(env.get("AWS_ACCOUNT_ID_ECR").unwrap(), "341304826755");
+    }
+
+    #[test]
+    fn test_to_env_map_preserves_bash_expansion() {
+        // ${VAR:-default} in variable values should still pass through
+        let v = vars(&[(
+            "NX_BASE",
+            "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-$CI_COMMIT_BEFORE_SHA}",
+        )]);
+        let env = to_env_map(&v);
+        assert_eq!(
+            env.get("NX_BASE").unwrap(),
+            "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-$CI_COMMIT_BEFORE_SHA}"
+        );
     }
 }

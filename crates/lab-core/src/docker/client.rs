@@ -123,16 +123,9 @@ impl DockerClient {
         }
         // Mount host Docker socket for DinD jobs.
         // Locally, DinD service is replaced with host Docker — faster and no TLS complexity.
-        if std::path::Path::new("/var/run/docker.sock").exists() {
+        if host_docker_socket_available() {
             binds.push("/var/run/docker.sock:/var/run/docker.sock".to_string());
-            // Override DinD-related env vars to use host socket instead of TLS
-            env_vec.retain(|e| {
-                !e.starts_with("DOCKER_HOST=")
-                    && !e.starts_with("DOCKER_TLS_VERIFY=")
-                    && !e.starts_with("DOCKER_CERT_PATH=")
-            });
-            env_vec.push("DOCKER_HOST=unix:///var/run/docker.sock".to_string());
-            env_vec.push("DOCKER_TLS_VERIFY=".to_string());
+            override_dind_env(&mut env_vec);
         }
 
         // Docker Security Hardening (per OWASP Docker Security Cheat Sheet):
@@ -218,7 +211,13 @@ impl DockerClient {
     ) -> Result<RunResult> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
-        let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+        // Override DinD env vars at exec level too (container env alone isn't enough —
+        // exec env takes precedence when the same var is set in both places).
+        if host_docker_socket_available() {
+            override_dind_env(&mut env_vec);
+        }
 
         let options = CreateExecOptions {
             cmd: Some(cmd.to_vec()),
@@ -327,6 +326,27 @@ impl DockerClient {
     }
 }
 
+/// Strip DinD-related env vars and replace with host Docker socket config.
+///
+/// When running locally, the DinD sidecar's TLS certs aren't shared between
+/// containers. Instead we mount the host Docker socket and override env vars
+/// so the Docker CLI inside the container talks to the host daemon directly.
+pub(crate) fn override_dind_env(env_vec: &mut Vec<String>) {
+    env_vec.retain(|e| {
+        !e.starts_with("DOCKER_HOST=")
+            && !e.starts_with("DOCKER_TLS_VERIFY=")
+            && !e.starts_with("DOCKER_CERT_PATH=")
+            && !e.starts_with("DOCKER_AUTH_CONFIG=")
+    });
+    env_vec.push("DOCKER_HOST=unix:///var/run/docker.sock".to_string());
+    env_vec.push("DOCKER_TLS_VERIFY=".to_string());
+}
+
+/// Check whether the host Docker socket is available for DinD passthrough.
+fn host_docker_socket_available() -> bool {
+    std::path::Path::new("/var/run/docker.sock").exists()
+}
+
 /// Get current user's UID:GID without unsafe code.
 pub fn get_current_uid_gid() -> String {
     let uid = std::process::Command::new("id")
@@ -348,4 +368,97 @@ pub fn get_current_uid_gid() -> String {
         .unwrap_or_else(|| "1000".to_string());
 
     format!("{uid}:{gid}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_dind_env_strips_docker_vars() {
+        let mut env = vec![
+            "DOCKER_HOST=tcp://docker:2376".to_string(),
+            "DOCKER_TLS_VERIFY=1".to_string(),
+            "DOCKER_CERT_PATH=/certs/client".to_string(),
+            "DOCKER_AUTH_CONFIG={\"auths\":{}}".to_string(),
+            "MY_VAR=keep_me".to_string(),
+            "PATH=/usr/bin".to_string(),
+        ];
+        override_dind_env(&mut env);
+
+        // Non-Docker vars preserved
+        assert!(env.contains(&"MY_VAR=keep_me".to_string()));
+        assert!(env.contains(&"PATH=/usr/bin".to_string()));
+
+        // DinD vars replaced
+        assert!(env.contains(&"DOCKER_HOST=unix:///var/run/docker.sock".to_string()));
+        assert!(env.contains(&"DOCKER_TLS_VERIFY=".to_string()));
+
+        // Original DinD vars removed
+        assert!(!env.iter().any(|e| e == "DOCKER_HOST=tcp://docker:2376"));
+        assert!(!env.iter().any(|e| e == "DOCKER_TLS_VERIFY=1"));
+        assert!(!env.iter().any(|e| e.starts_with("DOCKER_CERT_PATH=")));
+        assert!(!env.iter().any(|e| e.starts_with("DOCKER_AUTH_CONFIG=")));
+    }
+
+    #[test]
+    fn override_dind_env_no_docker_vars_present() {
+        let mut env = vec!["FOO=bar".to_string(), "CI=true".to_string()];
+        override_dind_env(&mut env);
+
+        assert!(env.contains(&"FOO=bar".to_string()));
+        assert!(env.contains(&"CI=true".to_string()));
+        assert!(env.contains(&"DOCKER_HOST=unix:///var/run/docker.sock".to_string()));
+        assert!(env.contains(&"DOCKER_TLS_VERIFY=".to_string()));
+        assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn override_dind_env_empty_input() {
+        let mut env: Vec<String> = vec![];
+        override_dind_env(&mut env);
+
+        assert_eq!(env.len(), 2);
+        assert!(env.contains(&"DOCKER_HOST=unix:///var/run/docker.sock".to_string()));
+        assert!(env.contains(&"DOCKER_TLS_VERIFY=".to_string()));
+    }
+
+    #[test]
+    fn override_dind_env_partial_docker_vars() {
+        let mut env = vec![
+            "DOCKER_HOST=tcp://docker:2375".to_string(),
+            "APP_PORT=3000".to_string(),
+        ];
+        override_dind_env(&mut env);
+
+        assert!(!env.iter().any(|e| e == "DOCKER_HOST=tcp://docker:2375"));
+        assert!(env.contains(&"DOCKER_HOST=unix:///var/run/docker.sock".to_string()));
+        assert!(env.contains(&"APP_PORT=3000".to_string()));
+    }
+
+    #[test]
+    fn override_dind_env_preserves_docker_prefixed_non_dind_vars() {
+        let mut env = vec![
+            "DOCKER_HOST=tcp://docker:2376".to_string(),
+            "DOCKER_BUILDKIT=1".to_string(),
+            "DOCKER_CLI_EXPERIMENTAL=enabled".to_string(),
+        ];
+        override_dind_env(&mut env);
+
+        // DOCKER_BUILDKIT and DOCKER_CLI_EXPERIMENTAL should be preserved
+        assert!(env.contains(&"DOCKER_BUILDKIT=1".to_string()));
+        assert!(env.contains(&"DOCKER_CLI_EXPERIMENTAL=enabled".to_string()));
+        // DOCKER_HOST replaced
+        assert!(env.contains(&"DOCKER_HOST=unix:///var/run/docker.sock".to_string()));
+    }
+
+    #[test]
+    fn get_uid_gid_returns_colon_separated() {
+        let result = get_current_uid_gid();
+        assert!(result.contains(':'));
+        let parts: Vec<&str> = result.split(':').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].parse::<u32>().is_ok());
+        assert!(parts[1].parse::<u32>().is_ok());
+    }
 }

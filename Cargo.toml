@@ -45,6 +45,5 @@ indexmap = { version = "2", features = ["serde"] }
 regex = "1"
 glob = "0.3"
 globset = "0.4"
-gix = { version = "0.72", default-features = false, features = ["revision", "attributes"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
